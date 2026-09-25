@@ -1079,8 +1079,14 @@ impl Session {
     }
 
     /// Ver `Machine::pinta_tela_na_placa`.
-    pub fn pinta_tela_na_placa(&mut self, largura: usize, altura: usize, rgb565: &[u8]) {
-        self.machine.pinta_tela_na_placa(largura, altura, rgb565);
+    pub fn pinta_tela_na_placa(
+        &mut self,
+        largura: usize,
+        altura: usize,
+        rgb565: &[u8],
+        faixa: (usize, usize),
+    ) {
+        self.machine.pinta_tela_na_placa(largura, altura, rgb565, faixa);
     }
 
     /// Ver `Machine::quadro_gl_intacto`.

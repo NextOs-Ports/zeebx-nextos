@@ -2,6 +2,13 @@
 /// Escritas do jogo numa superfície vigiada, entre duas sincronizações, a partir das quais ela
 /// passa ao modo cópia. Ver `sync_from_guest`.
 const TOQUES_PARA_COPIA: u64 = 16_384;
+
+/// O custo fixo de uma escrita na memória do jogo, em bytes copiados que custam o mesmo.
+///
+/// Decide, na saída de uma caixa suja, entre uma escrita por linha e uma faixa contígua que leva
+/// junto o que fica entre as linhas. Cada escrita atravessa o backend (região, invalidação de
+/// código, vigias): no perfil do .30 eram uns 600 ns cada, contra uns 300 ns para copiar 1 KB.
+const CUSTO_DE_UMA_ESCRITA_EM_BYTES: usize = 1024;
 /// Comparações seguidas sem mudança para uma superfície em modo cópia voltar a ser vigiada.
 const IGUAIS_PARA_VIGIAR: u32 = 64;
 
@@ -987,6 +994,8 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     /// Copia os pixels do host para o buffer que o jogo enxerga.
+    ///
+    /// Ver [`CUSTO_DE_UMA_ESCRITA_EM_BYTES`] para a escolha entre faixa e linhas.
     pub(super) fn sync_to_guest(&mut self, bitmap: u32) -> Result<(), CpuError> {
         let Some(&buffer) = self.dib_buffers.get(&bitmap) else {
             return Ok(());
@@ -998,6 +1007,20 @@ impl<C: CpuBackend> Machine<C> {
         };
         let serie = fb.serie();
         let sujeira = fb.toma_sujeira();
+        // A cópia do modo cópia acompanha o que o host escreve **aqui mesmo**, com os mesmos
+        // bytes: antes ela era relida inteira da memória do jogo a cada saída, num `Vec` novo de
+        // 600 KB (zerado pelo sistema, página a página) — no menu do FIFA, uma vez por quadro.
+        let passo = fb.passo_do_dib();
+        let tamanho = passo * fb.height() as usize;
+        let mut copia = self.dib_copia.remove(&bitmap);
+        let copia_certa = copia.as_ref().is_none_or(|c| c.len() == tamanho);
+        let espelha = |copia: &mut Option<Vec<u8>>, deslocamento: usize, bytes: &[u8]| {
+            if let Some(c) = copia.as_mut()
+                && let Some(destino) = c.get_mut(deslocamento..deslocamento + bytes.len())
+            {
+                destino.copy_from_slice(bytes);
+            }
+        };
         // **Só o que mudou vai para o jogo.** Esta superfície já foi publicada inteira, e o
         // buffer só ficou para trás no retângulo que desenhamos desde então. Um sprite muda
         // alguns milhares de pixels; reescrever os 600 KB dela a cada `IIMAGE_Draw` era 92% do
@@ -1006,17 +1029,26 @@ impl<C: CpuBackend> Machine<C> {
         // A faixa escrita vai do primeiro pixel da caixa ao último, inclusive o que fica entre
         // as linhas fora dela: ali os dois lados já são iguais, porque a importação roda antes
         // de todo desenho, e uma escrita contígua sai mais barata que uma por linha.
-        if !herdado && publicado == Some(serie) {
+        let parcial = !herdado && publicado == Some(serie);
+        if parcial {
             let Some([x0, y0, x1, y1]) = sujeira else {
+                if let Some(c) = copia {
+                    self.dib_copia.insert(bitmap, c);
+                }
                 return Ok(());
             };
             let largura = fb.width() as usize;
-            let passo = fb.passo_do_dib();
-            // **Faixa contígua só quando a caixa é larga.** Para um sprite, a faixa contígua
-            // levava as linhas inteiras entre a primeira e a última: um sprite de 32 linhas numa
-            // tela de 640 escrevia 40 KB em vez de 2 KB. No Pac-Mania eram 16 MB por quadro.
-            let estreita = ((x1 - x0) as usize) * 2 < largura;
-            if passo == largura * 2 && !estreita {
+            // **Faixa contígua quando ela custa menos que as escritas por linha.** Para um sprite,
+            // a faixa contígua levava as linhas inteiras entre a primeira e a última: um sprite de
+            // 32 linhas numa tela de 640 escrevia 40 KB em vez de 2 KB (no Pac-Mania eram 16 MB
+            // por quadro). Mas cada escrita na memória do jogo tem custo fixo — o Pac-Mania pinta
+            // o fundo em pedaços de 2×3, três escritas de 4 bytes cada —, e quando o que sobra
+            // entre as linhas cabe nesse custo, a faixa ganha.
+            let (linhas, bytes_da_linha) = ((y1 - y0) as usize, (x1 - x0) as usize * 2);
+            let custo_da_faixa = (linhas - 1) * largura * 2 + bytes_da_linha;
+            let custo_das_linhas = linhas * (bytes_da_linha + CUSTO_DE_UMA_ESCRITA_EM_BYTES);
+            let faixa = passo == largura * 2 && custo_da_faixa <= custo_das_linhas;
+            if faixa {
                 let inicio = y0 as usize * largura + x0 as usize;
                 let fim = (y1 as usize - 1) * largura + x1 as usize;
                 let bytes = fb.rgb565_fatia(inicio, fim);
@@ -1027,6 +1059,7 @@ impl<C: CpuBackend> Machine<C> {
                     conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.cpu.write_mem(buffer + inicio as u32 * 2, &bytes)?;
+                espelha(&mut copia, inicio * 2, &bytes);
             } else {
                 // Linha a linha: caixa estreita, ou enchimento no fim da linha, que faz a faixa
                 // contígua não bater com o buffer.
@@ -1041,6 +1074,7 @@ impl<C: CpuBackend> Machine<C> {
                     }
                     let destino = linha * passo + x0 as usize * 2;
                     self.cpu.write_mem(buffer + destino as u32, &bytes)?;
+                    espelha(&mut copia, destino, &bytes);
                 }
             }
         } else {
@@ -1052,15 +1086,21 @@ impl<C: CpuBackend> Machine<C> {
                 conta::BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             self.cpu.write_mem(buffer, &bytes)?;
+            espelha(&mut copia, 0, &bytes);
         }
-        self.dib_herdados.remove(&bitmap);
-        self.dib_publicado.insert(bitmap, serie);
-        // O que o host acabou de escrever não é mudança do jogo: a cópia acompanha.
-        if self.dib_copia.contains_key(&bitmap) {
-            let tamanho = self.bitmaps.get(&bitmap).map_or(0, |fb| fb.passo_do_dib() * fb.height() as usize);
-            let mut atual = vec![0u8; tamanho];
-            self.cpu.read_mem(buffer, &mut atual)?;
-            self.dib_copia.insert(bitmap, atual);
+        // Na saída parcial a superfície já era publicada e sem herança: nada a registrar.
+        if !parcial {
+            self.dib_herdados.remove(&bitmap);
+            self.dib_publicado.insert(bitmap, serie);
+        }
+        // O que o host acabou de escrever não é mudança do jogo: a cópia acompanha. Só é relida
+        // da memória quando não tinha o tamanho da superfície.
+        if let Some(mut c) = copia {
+            if !copia_certa {
+                c = vec![0u8; tamanho];
+                self.cpu.read_mem(buffer, &mut c)?;
+            }
+            self.dib_copia.insert(bitmap, c);
         }
         // A superfície do guest acabou de ficar **idêntica** à nossa — e foi a escrita acima que
         // ligou o sinalizador. Limpar aqui é o que permite pular a importação seguinte: sem
@@ -1192,19 +1232,53 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     pub(super) fn sync_surfaces_out(&mut self) -> Result<(), CpuError> {
-        // Mesma ideia do lado de lá: sem superfície escrita ou criada e sem mudança nos mapas de
-        // DIB desde a última passada completa, todas continuam publicadas.
-        let carimbo = (crate::video::display::carimbo_das_superficies(), self.dib_mudancas);
-        if self.dib_saida_limpa == Some(carimbo) {
-            return Ok(());
+        use crate::video::display::{cursor_das_sujas, sujas_desde, superficies_criadas};
+        // Mesma ideia do lado de lá: sem superfície criada e sem mudança nos mapas de DIB desde
+        // a última passada completa, toda superfície exposta ficou publicada, limpa e sem
+        // herança naquela passada. Dali em diante só pode ter ficado para trás a que ganhou caixa
+        // suja — e essas o anel de sujas lista, uma vez cada. Visitar só elas, em vez das 49
+        // superfícies do Pac-Mania a cada uma das 2.828 chamadas que desenham por quadro, é o
+        // que tirou a passada dos 15% do processador.
+        if let Some((criadas, mudancas, cursor)) = self.dib_saida_limpa
+            && criadas == superficies_criadas()
+            && mudancas == self.dib_mudancas
+        {
+            let mut sujas = std::mem::take(&mut self.dib_sujas);
+            sujas.clear();
+            let novo = sujas_desde(cursor, |serie| {
+                if let Some(&bitmap) = self.dib_por_serie.get(&serie) {
+                    sujas.push(bitmap);
+                }
+            });
+            if let Some(novo) = novo {
+                let mut resultado = Ok(());
+                for &bitmap in &sujas {
+                    resultado = self.sync_to_guest(bitmap);
+                    if resultado.is_err() {
+                        break;
+                    }
+                }
+                self.dib_sujas = sujas;
+                resultado?;
+                if let Some((_, _, cursor)) = self.dib_saida_limpa.as_mut() {
+                    *cursor = novo;
+                }
+                return Ok(());
+            }
+            self.dib_sujas = sujas;
         }
+        self.dib_saida_limpa = None;
+        // O cursor é lido **antes** da passada: o que ficar sujo durante ela entra depois dele e
+        // é visitado de novo na próxima, o que só custa uma consulta.
+        let cursor = cursor_das_sujas();
+        self.dib_por_serie.clear();
         for bitmap in self.dib_buffers.keys().copied().collect::<Vec<_>>() {
             self.sync_to_guest(bitmap)?;
+            if let Some(fb) = self.bitmaps.get(&bitmap) {
+                self.dib_por_serie.insert(fb.serie(), bitmap);
+            }
         }
-        self.dib_saida_limpa = Some((
-            crate::video::display::carimbo_das_superficies(),
-            self.dib_mudancas,
-        ));
+        self.dib_saida_limpa = Some((superficies_criadas(), self.dib_mudancas, cursor));
         Ok(())
     }
 

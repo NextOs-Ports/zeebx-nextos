@@ -1085,8 +1085,14 @@ impl<C: CpuBackend> Machine<C> {
     /// Se a tela do console ainda é o último quadro do GL: nada de 2D foi escrito nela depois do
     /// `eglSwapBuffers`. Falso também quando o jogo nunca apresentou pelo GL.
     /// Pinta a tela 2D do console no destino da placa. Ver `Rasterizador::pinta_tela_rgb565`.
-    pub fn pinta_tela_na_placa(&mut self, largura: usize, altura: usize, rgb565: &[u8]) {
-        self.gl.pinta_tela_rgb565(largura, altura, rgb565);
+    pub fn pinta_tela_na_placa(
+        &mut self,
+        largura: usize,
+        altura: usize,
+        rgb565: &[u8],
+        faixa: (usize, usize),
+    ) {
+        self.gl.pinta_tela_rgb565(largura, altura, rgb565, faixa);
     }
 
     pub fn quadro_gl_intacto(&self) -> bool {
