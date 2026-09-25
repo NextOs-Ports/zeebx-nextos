@@ -224,19 +224,25 @@ pub fn load_with(
         && std::env::var_os("ZEEBX_SEM_VFP").is_none()
     {
         true => {
-            let (bytes, trocas) = vfp::acelera(&mut module_bytes, MODULE_BASE - MODULE_PREFIX);
+            let (trampolins, trocas) = vfp::acelera(&mut module_bytes, MODULE_BASE - MODULE_PREFIX);
             if !trocas.is_empty() {
-                let lista: Vec<String> =
-                    trocas.iter().map(|t| format!("{}@{:#x}", t.nome, t.entrada)).collect();
+                let lista: Vec<String> = trocas
+                    .iter()
+                    .map(|t| format!("{}@{:#x} ({} chamadas)", t.nome, t.entrada, t.chamadas))
+                    .collect();
                 eprintln!("Zeebx: float por software trocado por VFP: {}", lista.join(", "));
             }
-            bytes
+            trampolins
         }
-        false => Vec::new(),
+        false => vfp::Trampolins::default(),
     };
     mem.map("module", MODULE_BASE - MODULE_PREFIX, module_bytes, true)?;
-    if !trampolins.is_empty() {
-        mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins, false, true)?;
+    if !trampolins.novos.is_empty() {
+        mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.novos, false, true)?;
+    }
+    // Só um estado salvo pela versão que trocava a entrada por `ldr pc` salta para cá.
+    if !trampolins.antigos.is_empty() {
+        mem.map_com_execucao("vfp-antigo", vfp::VFP_BASE_ANTIGO, trampolins.antigos, false, true)?;
     }
     // **A página nula se lê, e dá zero.** No console não há proteção de memória, e o que
     // mora nos endereços baixos é legível: um jogo que lê por um ponteiro nulo recebe algum
