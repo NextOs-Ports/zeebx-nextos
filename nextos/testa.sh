@@ -5,5 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR=/home/felipe/zeebx-nextos/target
+# Sem debuginfo e sem incremental: com eles o target/debug passava de 5 GB e enchia o disco.
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
 # Toca as fontes: o diretório compartilhado não separa worktrees (ver build-core.sh).
 exec flock /home/felipe/zeebx-nextos/.build.lock sh -c 'find src -type f -exec touch {} + ; exec cargo test --locked -p zeebx --lib "$@"' sh "$@"
