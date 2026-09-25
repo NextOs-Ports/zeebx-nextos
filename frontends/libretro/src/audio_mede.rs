@@ -236,3 +236,38 @@ pub(crate) fn encerra() -> Option<String> {
         m.total_estalos
     ))
 }
+
+/// Quadro corrente para o roteiro de botões — conta `retro_run`.
+static QUADRO: AtomicU32 = AtomicU32::new(0);
+
+/// Avança o contador do roteiro: uma vez por `retro_run`.
+pub(crate) fn conta_quadro() {
+    QUADRO.fetch_add(1, Relaxed);
+}
+
+/// `ZEEBX_AUDIO_TECLAS=quadro:id,...`: aperta o botão `id` do RetroPad (numeração da
+/// `libretro.h`: B=0, Y=1, SELECT=2, START=3, ... A=8) na porta 0 por seis quadros a partir de
+/// `quadro`.
+///
+/// Só existe para a bancada: medir o som de um jogo exige sair do menu, e no aparelho não há quem
+/// aperte o controle. O Caveman Ninja fica mudo na tela de aviso até alguém escolher CONTINUAR.
+pub(crate) fn roteiro_aperta(porta: u32, id: u32) -> bool {
+    static ROTEIRO: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    if porta != 0 {
+        return false;
+    }
+    let roteiro = ROTEIRO.get_or_init(|| {
+        std::env::var("ZEEBX_AUDIO_TECLAS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|par| {
+                let (q, b) = par.split_once(':')?;
+                Some((q.trim().parse().ok()?, b.trim().parse().ok()?))
+            })
+            .collect()
+    });
+    let agora = QUADRO.load(Relaxed);
+    roteiro
+        .iter()
+        .any(|&(q, b)| b == id && (q..q + 6).contains(&agora))
+}

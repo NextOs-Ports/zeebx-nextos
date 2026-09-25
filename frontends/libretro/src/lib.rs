@@ -16,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use zeebx::audio::Mixer;
 
 mod audio_mede;
+mod ritmo_audio;
 use zeebx::config::ZWheel;
 use zeebx::input::Pad;
 use zeebx::input::bindings::Aparelho;
@@ -636,8 +637,11 @@ struct Core {
     swaps_vistos: u32,
     /// Relógio virtual da última chamada, para o áudio acompanhar o tempo que passou de verdade.
     ultimo_relogio_ms: u32,
-    /// A medição de áudio pediu o aviso de buffer ao frontend (sem mexer na latência dele).
+    /// O aviso de ocupação do buffer já foi pedido ao frontend (sem mexer na latência dele): é a
+    /// régua do [`ritmo_audio`] e da medição.
     audio_mede_callback: bool,
+    /// Quantas amostras entregar por `retro_run`, pelo relógio real — ver [`ritmo_audio`].
+    ritmo: ritmo_audio::RitmoAudio,
     /// Amostras que o frontend não aceitou e ficam para a chamada seguinte.
     audio_pendente: Vec<i16>,
     /// Se já avisou que o quadro saiu do tamanho do console.
@@ -840,11 +844,12 @@ fn le_pad(porta: u32, bitmasks: bool) -> Pad {
         false => 0,
     };
     let botao = |id: u32| -> bool {
-        match bitmasks {
-            true => mascara & (1 << id) != 0,
-            // SAFETY: consulta de estado do próprio frontend.
-            false => unsafe { state(porta, DEVICE_JOYPAD, 0, id) != 0 },
-        }
+        audio_mede::roteiro_aperta(porta, id)
+            || match bitmasks {
+                true => mascara & (1 << id) != 0,
+                // SAFETY: consulta de estado do próprio frontend.
+                false => unsafe { state(porta, DEVICE_JOYPAD, 0, id) != 0 },
+            }
     };
     let mut pad = Pad::default();
     let mapa = [
@@ -1589,8 +1594,8 @@ unsafe extern "C" fn audio_buffer_status(active: bool, occupancy: u32, underrun_
     AUDIO_ESTOURO_PROVAVEL.store(active && underrun_likely, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Só o aviso de ocupação do buffer, para a medição de áudio: **sem** pedir latência mínima, que
-/// mudaria justamente o que se quer medir.
+/// Só o aviso de ocupação do buffer, régua do ritmo do áudio e da medição: **sem** pedir latência
+/// mínima, que mudaria a folga que o dono configurou no frontend.
 fn pede_aviso_de_buffer_para_medir() -> bool {
     let cb = RetroAudioBufferStatusCallback {
         callback: Some(audio_buffer_status),
@@ -1601,6 +1606,12 @@ fn pede_aviso_de_buffer_para_medir() -> bool {
             &cb as *const _ as *mut c_void,
         )
     }
+}
+
+/// `ZEEBX_AUDIO_VIRTUAL=1`: o som volta a andar pelo relógio virtual, como antes do ritmo real.
+fn ritmo_virtual() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("ZEEBX_AUDIO_VIRTUAL").is_ok_and(|v| v != "0"))
 }
 
 /// Pede ao frontend para avisar sobre o buffer de áudio, e mais folga nele para o aviso chegar a
@@ -2215,6 +2226,7 @@ unsafe fn carrega(
         swaps_vistos: 0,
         ultimo_relogio_ms: 0,
         audio_mede_callback: false,
+        ritmo: ritmo_audio::RitmoAudio::default(),
         audio_pendente: Vec::new(),
         avisou_tamanho: false,
         midi_backend,
@@ -2326,12 +2338,15 @@ fn troca_para(estado: &mut Core, caminho: &Path, aberto_pela_z_wheel: bool) -> R
     estado.ultima_assinatura = None;
     estado.select_antes = false;
     estado.ultimo_relogio_ms = estado.session.clock_ms();
+    // A troca carregou outro jogo: o intervalo da carga não é som que falte.
+    estado.ritmo.zera();
     Ok(())
 }
 
 /// `retro_run`: um quadro virtual, um quadro de vídeo e o áudio correspondente.
 #[unsafe(no_mangle)]
 pub extern "C" fn retro_run() {
+    audio_mede::conta_quadro();
     let inicio = zeebx::video::gpu::mede::agora();
     retro_run_dentro();
     if let Some(inicio) = inicio {
@@ -2707,7 +2722,17 @@ fn retro_run_dentro() {
         let agora = estado.session.clock_ms();
         let decorrido = u64::from(agora.wrapping_sub(estado.ultimo_relogio_ms));
         estado.ultimo_relogio_ms = agora;
-        let devidas = (decorrido.min(1000) * u64::from(SAMPLE_RATE) / 1000) as usize;
+        let devidas_virtuais = (decorrido.min(1000) * u64::from(SAMPLE_RATE) / 1000) as usize;
+        // **O som anda o tempo real**, não o virtual: ver [`ritmo_audio`]. `ZEEBX_AUDIO_VIRTUAL=1`
+        // volta ao ritmo antigo, para comparar as duas coisas no mesmo core.
+        let devidas = if ritmo_virtual() {
+            devidas_virtuais
+        } else {
+            let ocupacao = audio_mede::OCUPACAO.load(std::sync::atomic::Ordering::Relaxed);
+            estado
+                .ritmo
+                .quadros(std::time::Instant::now(), (ocupacao != u32::MAX).then_some(ocupacao))
+        };
         let virtual_decorrido = decorrido;
         let devidas_medidas = devidas;
         let mut som = std::mem::take(&mut estado.audio);
@@ -2762,10 +2787,10 @@ fn retro_run_dentro() {
             // A sobra não pode crescer sem fim; meio segundo é o teto.
             let limite = (SAMPLE_RATE as usize / 2) * 2;
             sobra.truncate(limite);
+            if !estado.frameskip_callback_pedido && !estado.audio_mede_callback {
+                estado.audio_mede_callback = pede_aviso_de_buffer_para_medir();
+            }
             if audio_mede::ligado(&estado.path) {
-                if !estado.frameskip_callback_pedido && !estado.audio_mede_callback {
-                    estado.audio_mede_callback = pede_aviso_de_buffer_para_medir();
-                }
                 if let Some(texto) = audio_mede::registra(
                     virtual_decorrido,
                     devidas_medidas,
