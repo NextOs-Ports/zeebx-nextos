@@ -19,7 +19,7 @@ corename = "Zeebx"
 license = "GPLv2+"
 permissions = ""
 # Acompanha a versão do crate. Ver o `version` do `Cargo.toml` da raiz.
-display_version = "0.3.0"
+display_version = "0.3.0-nextos"
 categories = "Emulator"
 
 # Hardware Information
@@ -49,7 +49,8 @@ load_subsystem = "false"
 # consegue, ele volta para o rasterizador de software** -- a linha abaixo é o que o desenho na
 # placa exige, não o que o core exige para rodar.
 hw_render = "true"
-required_hw_api = "OpenGL Core >= 3.3 | OpenGL ES >= 3.2"
+# Mali-400/450 (NextOS, CoreELEC) só têm OpenGL ES 2.0: o core detecta o Utgard e pede GLES2.
+required_hw_api = "OpenGL Core >= 3.3 | OpenGL ES >= 3.2 | OpenGL ES >= 2.0"
 # Os dois vêm do `retro_get_system_info`: o jogo é aberto por caminho, e o `.zip` é do console,
 # não do frontend -- quem o abre é o BREW.
 needs_fullpath = "true"
