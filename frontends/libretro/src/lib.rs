@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use zeebx::audio::Mixer;
+
+mod audio_mede;
 use zeebx::config::ZWheel;
 use zeebx::input::Pad;
 use zeebx::input::bindings::Aparelho;
@@ -634,6 +636,8 @@ struct Core {
     swaps_vistos: u32,
     /// Relógio virtual da última chamada, para o áudio acompanhar o tempo que passou de verdade.
     ultimo_relogio_ms: u32,
+    /// A medição de áudio pediu o aviso de buffer ao frontend (sem mexer na latência dele).
+    audio_mede_callback: bool,
     /// Amostras que o frontend não aceitou e ficam para a chamada seguinte.
     audio_pendente: Vec<i16>,
     /// Se já avisou que o quadro saiu do tamanho do console.
@@ -1577,10 +1581,26 @@ static AUDIO_ESTOURO_PROVAVEL: std::sync::atomic::AtomicBool = std::sync::atomic
 /// Guarda só `underrun_likely`, que é a própria `libretro.h` quem diz o que fazer com ele: *"se
 /// verdadeiro, o core deveria tentar pular quadro"*. A ocupação em si não muda a decisão — o
 /// frontend já fez a conta e decidiu que **agora** é a hora de pular.
-unsafe extern "C" fn audio_buffer_status(active: bool, _occupancy: u32, underrun_likely: bool) {
+unsafe extern "C" fn audio_buffer_status(active: bool, occupancy: u32, underrun_likely: bool) {
+    audio_mede::OCUPACAO.store(if active { occupancy } else { u32::MAX }, std::sync::atomic::Ordering::Relaxed);
+    audio_mede::SECANDO.store(active && underrun_likely, std::sync::atomic::Ordering::Relaxed);
     // Sem áudio no frontend não há buffer para proteger. Guardar um `true` velho nesse caso faria
     // Automático pular desenho para sempre depois que o usuário desliga e liga o áudio no menu.
     AUDIO_ESTOURO_PROVAVEL.store(active && underrun_likely, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Só o aviso de ocupação do buffer, para a medição de áudio: **sem** pedir latência mínima, que
+/// mudaria justamente o que se quer medir.
+fn pede_aviso_de_buffer_para_medir() -> bool {
+    let cb = RetroAudioBufferStatusCallback {
+        callback: Some(audio_buffer_status),
+    };
+    unsafe {
+        environ(
+            ENV_SET_AUDIO_BUFFER_STATUS_CALLBACK,
+            &cb as *const _ as *mut c_void,
+        )
+    }
 }
 
 /// Pede ao frontend para avisar sobre o buffer de áudio, e mais folga nele para o aviso chegar a
@@ -1883,7 +1903,7 @@ fn limpa_estado_do_frontend() {
     let tinha_audio = if let Ok(mut guard) = core().lock() {
         let tinha = guard
             .as_ref()
-            .is_some_and(|EstadoDoCore(c)| c.frameskip_callback_pedido);
+            .is_some_and(|EstadoDoCore(c)| c.frameskip_callback_pedido || c.audio_mede_callback);
         *guard = None;
         tinha
     } else {
@@ -1912,6 +1932,9 @@ fn limpa_estado_do_frontend() {
 /// `retro_deinit`.
 #[unsafe(no_mangle)]
 pub extern "C" fn retro_deinit() {
+    if let Some(texto) = audio_mede::encerra() {
+        log(&texto);
+    }
     limpa_estado_do_frontend();
 }
 
@@ -2191,6 +2214,7 @@ unsafe fn carrega(
         ultima_assinatura: None,
         swaps_vistos: 0,
         ultimo_relogio_ms: 0,
+        audio_mede_callback: false,
         audio_pendente: Vec::new(),
         avisou_tamanho: false,
         midi_backend,
@@ -2393,7 +2417,7 @@ fn retro_run_dentro() {
     // Os buffers saem do estado antes das chamadas ao frontend: nenhum cadeado do core fica preso
     // enquanto o frontend executa, e é isso que impede um aviso dele — "disco cheio, quer salvar?"
     // — de travar o emulador.
-    let (frame, audio, largura, altura, duplicado, quadro_2d) = {
+    let (frame, audio, largura, altura, duplicado, quadro_2d, virtual_decorrido, devidas_medidas) = {
         let Ok(mut guard) = core().lock() else {
             return;
         };
@@ -2684,6 +2708,8 @@ fn retro_run_dentro() {
         let decorrido = u64::from(agora.wrapping_sub(estado.ultimo_relogio_ms));
         estado.ultimo_relogio_ms = agora;
         let devidas = (decorrido.min(1000) * u64::from(SAMPLE_RATE) / 1000) as usize;
+        let virtual_decorrido = decorrido;
+        let devidas_medidas = devidas;
         let mut som = std::mem::take(&mut estado.audio);
         som.clear();
         // O que o frontend não aceitou da vez anterior vai na frente, para não sumir um pedaço.
@@ -2691,7 +2717,7 @@ fn retro_run_dentro() {
         for amostra in estado.mixer.render(devidas) {
             som.push((amostra.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16);
         }
-        (quadro, som, largura, altura, duplicado, quadro_2d)
+        (quadro, som, largura, altura, duplicado, quadro_2d, virtual_decorrido, devidas_medidas)
     };
     let frente = callbacks();
     if let Some(video) = frente.video {
@@ -2716,14 +2742,17 @@ fn retro_run_dentro() {
     }
     // O retorno do lote é em quadros **aceitos**; o que sobrar espera a próxima chamada.
     let mut sobra = Vec::new();
+    let mut aceitos_medidos = 0;
     if let Some(batch) = frente.audio_batch {
         let quadros = audio.len() / 2;
         // SAFETY: o lote é intercalado em estéreo e o tamanho é o número de quadros.
         let aceitos = unsafe { batch(audio.as_ptr(), quadros) }.min(quadros);
+        aceitos_medidos = aceitos;
         if aceitos < quadros {
             sobra = audio[aceitos * 2..].to_vec();
         }
     }
+    let sobra_bruta = sobra.len() / 2;
     // Os buffers voltam para o estado, para a próxima chamada reaproveitar a mesma alocação.
     let mut dispensar = false;
     if let Ok(mut guard) = core().lock() {
@@ -2733,6 +2762,21 @@ fn retro_run_dentro() {
             // A sobra não pode crescer sem fim; meio segundo é o teto.
             let limite = (SAMPLE_RATE as usize / 2) * 2;
             sobra.truncate(limite);
+            if audio_mede::ligado(&estado.path) {
+                if !estado.frameskip_callback_pedido && !estado.audio_mede_callback {
+                    estado.audio_mede_callback = pede_aviso_de_buffer_para_medir();
+                }
+                if let Some(texto) = audio_mede::registra(
+                    virtual_decorrido,
+                    devidas_medidas,
+                    &estado.audio,
+                    aceitos_medidos,
+                    sobra.len() / 2,
+                    sobra_bruta - sobra.len() / 2,
+                ) {
+                    log(&texto);
+                }
+            }
             estado.audio_pendente = sobra;
             if estado.parou {
                 estado.quadros_apos_parar += 1;
