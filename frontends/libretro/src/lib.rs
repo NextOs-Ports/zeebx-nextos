@@ -629,6 +629,9 @@ struct Core {
     aceita_dupe: bool,
     /// Assinatura do último quadro entregue.
     ultima_assinatura: Option<u64>,
+    /// As trocas de buffer do GL vistas no quadro anterior. Com placa, um quadro sem troca é
+    /// quadro 2D (IDisplay): vai por software, porque o framebuffer do frontend não tem nada dele.
+    swaps_vistos: u32,
     /// Relógio virtual da última chamada, para o áudio acompanhar o tempo que passou de verdade.
     ultimo_relogio_ms: u32,
     /// Amostras que o frontend não aceitou e ficam para a chamada seguinte.
@@ -2186,6 +2189,7 @@ unsafe fn carrega(
         bitmasks: false,
         aceita_dupe: false,
         ultima_assinatura: None,
+        swaps_vistos: 0,
         ultimo_relogio_ms: 0,
         audio_pendente: Vec::new(),
         avisou_tamanho: false,
@@ -2373,7 +2377,7 @@ fn retro_run_dentro() {
     // Os buffers saem do estado antes das chamadas ao frontend: nenhum cadeado do core fica preso
     // enquanto o frontend executa, e é isso que impede um aviso dele — "disco cheio, quer salvar?"
     // — de travar o emulador.
-    let (frame, audio, largura, altura, duplicado) = {
+    let (frame, audio, largura, altura, duplicado, quadro_2d) = {
         let Ok(mut guard) = core().lock() else {
             return;
         };
@@ -2587,13 +2591,37 @@ fn retro_run_dentro() {
             }
         }
         // Vídeo: o framebuffer do console, no formato negociado.
+        // **Com placa, só o quadro que passou pelo GL está no framebuffer do frontend.** Um jogo
+        // só 2D (o 276212 da Namco, as telas de IDisplay) nunca troca buffer de GL e aparecia
+        // preto. Vai por software o quadro sem troca de GL **e** com 2D escrito na tela depois da
+        // última troca — a segunda condição segura os jogos que desenham GL a 30 quadros, cujo
+        // quadro sem troca é só repetição. Converter e tirar assinatura da tela só nesse caso: no
+        // resto não serviria a ninguém (11% do processador no NFS Carbon).
+        let swaps = estado.session.gl_swaps();
+        let quadro_2d = placa().is_some()
+            && swaps == estado.swaps_vistos
+            && !estado.session.quadro_gl_intacto();
+        if zeebx::video::gpu::mede::ligado() {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static Q: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+            Q[0].fetch_add(u64::from(swaps != estado.swaps_vistos), Relaxed);
+            Q[1].fetch_add(u64::from(estado.session.quadro_gl_intacto()), Relaxed);
+            Q[2].fetch_add(u64::from(quadro_2d), Relaxed);
+            if Q[0].load(Relaxed) + Q[2].load(Relaxed) >= 120 {
+                log(&format!(
+                    "Zeebx MEDE quadros: {} com troca de GL, {} com GL intacto, {} por software (2D)",
+                    Q[0].swap(0, Relaxed), Q[1].swap(0, Relaxed), Q[2].swap(0, Relaxed)
+                ));
+            }
+        }
+        estado.swaps_vistos = swaps;
         let tela = estado.session.screen();
         let (largura, altura) = (tela.width(), tela.height());
         // Com placa, o frontend recorta do framebuffer dele só o retângulo com conteúdo e o estica
         // para a tela; sem isto, um jogo com superfície menor (Quake, Galaxy on Fire) aparecia num
         // canto. Ver `Machine::retangulo_do_quadro_gl`.
         let (largura, altura) = match placa() {
-            Some(_) => {
+            Some(_) if !quadro_2d => {
                 let (l, a) = estado.session.retangulo_do_quadro_gl();
                 if l > 0 && a > 0 && l <= largura as usize && a <= altura as usize {
                     (l as u32, a as u32)
@@ -2601,7 +2629,7 @@ fn retro_run_dentro() {
                     (largura, altura)
                 }
             }
-            None => (largura, altura),
+            _ => (largura, altura),
         };
         // O console é 640×480, e é esse o quadro que o shader espera receber. Um tamanho
         // diferente é avisado uma vez, em vez de aparecer como imagem torta sem explicação.
@@ -2615,9 +2643,7 @@ fn retro_run_dentro() {
         // 30 FPS é cadência de apresentação, não só otimização 3D: no quadro oculto preservamos
         // os bytes anteriores. Se o frontend aceita dupe, entregaremos ponteiro nulo; se não
         // aceita, entregaremos os mesmos bytes de novo — nos dois casos a imagem é realmente 30.
-        // Com placa o frontend apresenta o framebuffer dele: converter a tela do console e tirar a
-        // assinatura dela a cada quadro não servia a ninguém (11% do processador no NFS Carbon).
-        let duplicado = if placa().is_some() {
+        let duplicado = if placa().is_some() && !quadro_2d {
             false
         } else if estado.limite_fps_duplica {
             estado.aceita_dupe
@@ -2628,6 +2654,13 @@ fn retro_run_dentro() {
             estado.ultima_assinatura = Some(assinatura);
             igual
         };
+        // O quadro 2D vai para o framebuffer do frontend como textura: com contexto de placa o
+        // RetroArch apresenta o framebuffer e ignora quadro por software.
+        if quadro_2d && !duplicado {
+            estado
+                .session
+                .pinta_tela_na_placa(largura as usize, altura as usize, &quadro);
+        }
         // Áudio: **o tempo vem do relógio virtual**, não de um número fixo. Um jogo que passa dois
         // quadros virtuais entre duas chamadas precisa entregar o dobro de amostras, senão o som
         // atrasa em relação à imagem e o frontend engasga ao tentar acompanhar.
@@ -2642,11 +2675,12 @@ fn retro_run_dentro() {
         for amostra in estado.mixer.render(devidas) {
             som.push((amostra.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16);
         }
-        (quadro, som, largura, altura, duplicado)
+        (quadro, som, largura, altura, duplicado, quadro_2d)
     };
     let frente = callbacks();
     if let Some(video) = frente.video {
         let na_placa = placa().is_some();
+        let _ = quadro_2d;
         let (ponteiro, _) = match (na_placa, duplicado) {
             // **Em modo de placa o quadro já está no framebuffer do frontend**: entregar pixels
             // aqui seria mentira, e o `libretro` tem um sentinela para dizer exatamente isso.

@@ -1073,6 +1073,21 @@ impl Session {
 
     /// O quadro 3D na resolução interna, quando é ele que está à mostra. Ver
     /// [`crate::machine::Machine::quadro_na_placa`].
+    /// Quantas trocas de buffer do OpenGL o jogo já fez. Ver `Machine::gl_swaps`.
+    pub fn gl_swaps(&self) -> u32 {
+        self.machine.gl_swaps()
+    }
+
+    /// Ver `Machine::pinta_tela_na_placa`.
+    pub fn pinta_tela_na_placa(&mut self, largura: usize, altura: usize, rgb565: &[u8]) {
+        self.machine.pinta_tela_na_placa(largura, altura, rgb565);
+    }
+
+    /// Ver `Machine::quadro_gl_intacto`.
+    pub fn quadro_gl_intacto(&self) -> bool {
+        self.machine.quadro_gl_intacto()
+    }
+
     /// Ver [`crate::machine::Machine::retangulo_do_quadro_gl`].
     pub fn retangulo_do_quadro_gl(&self) -> (usize, usize) {
         self.machine.retangulo_do_quadro_gl()

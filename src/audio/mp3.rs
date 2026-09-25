@@ -171,6 +171,62 @@ fn inicio_do_audio(bytes: &[u8]) -> usize {
     0
 }
 
+/// Quantos canais o primeiro quadro declara: o modo de canal é `11` só no mono.
+fn canais(data: &[u8]) -> Option<u16> {
+    let start = id3_len(data);
+    let head = data.get(start..start + 4)?;
+    Some(if head[3] >> 6 == 0b11 { 1 } else { 2 })
+}
+
+/// Como [`decode_detalhado`], mas devolve na hora um som com a duração da sondagem e decodifica
+/// numa thread à parte.
+///
+/// **Por que existe.** A trilha inteira era decodificada ao carregar: no Mali-450, 192 s de MP3
+/// levaram 1,77 s, e um jogo da Namco carrega quatro trilhas na abertura. Taxa, canais e quadros
+/// saem do cabeçalho; quando a sondagem não reconhece o arquivo, volta ao caminho síncrono. Se a
+/// decodificação discordar da sondagem em taxa ou canais, o som fica mudo em vez de tocar errado.
+pub fn decode_em_segundo_plano(data: &[u8]) -> Result<crate::audio::wav::Sound, String> {
+    let (Some(info), Some(canais)) = (probe(data), canais(data)) else {
+        return decode_detalhado(data);
+    };
+    let quadros = (info.frames * u64::from(info.samples_per_frame)) as usize;
+    if quadros == 0 || info.rate == 0 {
+        return decode_detalhado(data);
+    }
+    let celula = std::sync::Arc::new(std::sync::OnceLock::new());
+    let destino = celula.clone();
+    let bytes = data.to_vec();
+    let (taxa, lancou) = (
+        info.rate,
+        std::thread::Builder::new().name("zeebx-mp3".into()).spawn(move || {
+            let amostras = match decode_detalhado(&bytes) {
+                Ok(som) if som.rate == info.rate && som.channels == canais => som.samples,
+                Ok(som) => {
+                    eprintln!(
+                        "Zeebx: MP3 decodificado com {} Hz/{} canais, a sondagem disse {} Hz/{canais}; fica mudo",
+                        som.rate, som.channels, info.rate
+                    );
+                    Vec::new()
+                }
+                Err(erro) => {
+                    eprintln!("Zeebx: MP3 em segundo plano falhou: {erro}");
+                    Vec::new()
+                }
+            };
+            let _ = destino.set(amostras);
+        }),
+    );
+    if lancou.is_err() {
+        return decode_detalhado(data);
+    }
+    Ok(crate::audio::wav::Sound {
+        rate: taxa,
+        channels: canais,
+        samples: Vec::new(),
+        tardio: Some((quadros, celula)),
+    })
+}
+
 pub fn decode_detalhado(data: &[u8]) -> Result<crate::audio::wav::Sound, String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
@@ -367,6 +423,21 @@ mod tests {
         data.extend(tekken_header(100));
         let mp3 = probe(&data).expect("é um MP3");
         assert_eq!(mp3.frames, 100);
+    }
+
+    #[test]
+    fn em_segundo_plano_entrega_o_mesmo_audio() {
+        let dados = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/teste/tom-440hz.mp3"))
+            .expect("fixture do repositório");
+        let sincrono = decode_detalhado(&dados).expect("decodifica");
+        let tardio = decode_em_segundo_plano(&dados).expect("decodifica");
+        assert_eq!((tardio.rate, tardio.channels), (sincrono.rate, sincrono.channels));
+        let (_, celula) = tardio.tardio.as_ref().expect("a fixture tem cabeçalho legível");
+        assert_eq!(celula.wait(), &sincrono.samples);
+        // A duração declarada vem do cabeçalho: pode diferir do decodificado pelo atraso do
+        // codificador, nunca por mais de dois quadros MP3.
+        let diferenca = tardio.frames().abs_diff(sincrono.frames());
+        assert!(diferenca <= 2 * 1152, "declarado {} contra {}", tardio.frames(), sincrono.frames());
     }
 
     #[test]

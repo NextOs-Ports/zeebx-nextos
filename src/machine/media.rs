@@ -484,7 +484,19 @@ impl<C: CpuBackend> Machine<C> {
         // e trilha não tocava em jogo nenhum.
         let som = match crate::audio::wav::parse(bytes) {
             Ok(sound) => Some(sound),
-            Err(sem_wav) => match crate::audio::mp3::decode_detalhado(bytes) {
+            Err(sem_wav) => match {
+                let t_mp3 = std::time::Instant::now();
+                let r = crate::audio::mp3::decode_em_segundo_plano(bytes);
+                if let Ok(ref som) = r {
+                    eprintln!(
+                        "Zeebx: MP3 {} bytes -> {:.1}s de áudio, preparo em {:.1}ms",
+                        bytes.len(),
+                        som.frames() as f64 / f64::from(som.rate.max(1)),
+                        t_mp3.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                r
+            } {
                 Ok(sound) => Some(sound),
                 // **O banco de amostras vem antes da tabela de timbres.** Quando ele existe, a
                 // partitura é tocada com as amostras de verdade, e o que a tabela não alcança (a

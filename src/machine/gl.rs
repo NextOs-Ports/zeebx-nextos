@@ -1082,6 +1082,17 @@ impl<C: CpuBackend> Machine<C> {
         self.gl.surface()
     }
 
+    /// Se a tela do console ainda é o último quadro do GL: nada de 2D foi escrito nela depois do
+    /// `eglSwapBuffers`. Falso também quando o jogo nunca apresentou pelo GL.
+    /// Pinta a tela 2D do console no destino da placa. Ver `Rasterizador::pinta_tela_rgb565`.
+    pub fn pinta_tela_na_placa(&mut self, largura: usize, altura: usize, rgb565: &[u8]) {
+        self.gl.pinta_tela_rgb565(largura, altura, rgb565);
+    }
+
+    pub fn quadro_gl_intacto(&self) -> bool {
+        self.escritas_do_quadro_gl == Some(self.screen().escritas())
+    }
+
     pub fn quadro_na_placa(&self) -> Option<crate::video::rasterizer::QuadroNaPlaca> {
         let intacta = self.escritas_do_quadro_gl == Some(self.screen().escritas());
         intacta.then(|| self.gl.quadro_na_placa()).flatten()

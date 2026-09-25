@@ -754,6 +754,10 @@ pub trait Rasterizador {
         false
     }
 
+    /// Pinta a tela do console (RGB565, linha 0 no topo) no destino do desenho, cobrindo
+    /// `largura`×`altura` a partir do canto. É como um quadro 2D chega ao framebuffer do frontend.
+    fn pinta_tela_rgb565(&mut self, _largura: usize, _altura: usize, _rgb565: &[u8]) {}
+
     fn frame_rgb565(&mut self, width: usize, height: usize, out: &mut Vec<u8>);
     fn import_rgb565_changes(&mut self, width: usize, height: usize, old: &[u8], new: &[u8]);
 

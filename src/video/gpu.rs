@@ -272,6 +272,8 @@ pub struct GpuState {
     soltos: Vec<Vertex>,
     /// A textura de apoio do [`GpuState::import_rgb565_changes`].
     ponte: glow::Texture,
+    /// A textura da tela 2D, para [`Rasterizador::pinta_tela_rgb565`]. Criada no primeiro uso.
+    tela_2d: Option<glow::Texture>,
     texturas: HashMap<u32, Textura>,
     /// Buffers reaproveitados entre chamadas, para não pedir memória por quadro.
     vertices: Vec<f32>,
@@ -398,6 +400,7 @@ impl GpuState {
             estado_do_lote: None,
             soltos: Vec::new(),
             ponte,
+            tela_2d: None,
             texturas: HashMap::new(),
             vertices: Vec::new(),
             pixels: Vec::new(),
@@ -1282,6 +1285,9 @@ impl Drop for GpuState {
             }
             gl.delete_buffer(self.vbo);
             gl.delete_texture(self.ponte);
+            if let Some(t) = self.tela_2d {
+                gl.delete_texture(t);
+            }
             for t in self.texturas.values() {
                 gl.delete_texture(t.objeto);
             }
@@ -2003,6 +2009,85 @@ impl Rasterizador for GpuState {
 
     fn quadro_no_frontend(&self) -> bool {
         self.fbo_externo.is_some() && !leitura_forcada()
+    }
+
+    fn pinta_tela_rgb565(&mut self, largura: usize, altura: usize, rgb565: &[u8]) {
+        if largura == 0 || altura == 0 || rgb565.len() < largura * altura * 2 {
+            return;
+        }
+        self.descarrega();
+        let gl = self.gl.clone();
+        let textura = match self.tela_2d {
+            Some(t) => t,
+            None => match unsafe { gl.create_texture() } {
+                Ok(t) => {
+                    self.tela_2d = Some(t);
+                    t
+                }
+                Err(_) => return,
+            },
+        };
+        self.destino();
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(textura));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 2);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGB as i32,
+                largura as i32,
+                altura as i32,
+                0,
+                glow::RGB,
+                glow::UNSIGNED_SHORT_5_6_5,
+                glow::PixelUnpackData::Slice(Some(&rgb565[..largura * altura * 2])),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            for (nome, valor) in [
+                (glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32),
+                (glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, nome, valor);
+            }
+        }
+        // O retângulo cobre a tela inteira, e a linha 0 do framebuffer é o topo: a textura entra
+        // sem virar (`virar` +1), como na ponte do `import`.
+        self.vertices.clear();
+        for ([px, py], uv) in [
+            ([-1.0f32, -1.0f32], [0.0f32, 0.0f32]),
+            ([1.0, -1.0], [1.0, 0.0]),
+            ([1.0, 1.0], [1.0, 1.0]),
+            ([-1.0, 1.0], [0.0, 1.0]),
+        ] {
+            self.poe(&Vertex {
+                position: [px, py, 0.0, 1.0],
+                color: [1.0; 4],
+                uv,
+                normal: [0.0, 0.0, 1.0],
+                uv1: [0.0; 2],
+                fog: 1.0,
+            });
+        }
+        let guarda = self.fill.clone();
+        self.fill.viewport_do_topo_fixa = Some((0, 0, largura as i32, altura as i32));
+        self.fill.tesoura_ligada = false;
+        self.fill.teste_profundidade = false;
+        self.fill.teste_stencil = false;
+        self.fill.mistura = false;
+        self.fill.descarte = false;
+        self.fill.mascara_profundidade = false;
+        self.fill.mascara_cor = [true; 4];
+        self.fill.env_textura = TexEnv::com_modo(gles::GL_REPLACE);
+        self.fill.unidade1.ligada = false;
+        self.fill.teste_alfa = false;
+        self.fill.neblina.ligada = false;
+        let em_perspectiva = std::mem::replace(&mut self.em_perspectiva, false);
+        self.submete_com(glow::TRIANGLE_FAN, 1.0, Some(textura));
+        self.em_perspectiva = em_perspectiva;
+        self.fill = guarda;
+        self.devolve_o_contexto();
     }
 
     fn desenha_no_fbo(&mut self, fbo: Option<u32>) {
