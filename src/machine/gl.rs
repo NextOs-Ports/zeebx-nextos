@@ -44,7 +44,7 @@ impl<C: CpuBackend> Machine<C> {
             self.sync_egl_color_from_guest()?;
         }
         let base = usize::from(!legacy);
-        let a: [u32; 10] = std::array::from_fn(|i| self.arg(base + i));
+        let a = self.args_de_gl(base);
         let this = self.arg(0);
         // As variantes `x` levam ponto fixo 16.16 e as `f`, `float` de 32 bits — mesma função,
         // só muda como o número chega.
@@ -1021,6 +1021,39 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     /// N-ésimo argumento da AAPCS: `r0..r3` e, daí em diante, palavras da pilha.
+    /// Os dez argumentos de uma chamada de GL a partir de `base`, com a pilha lida de uma vez.
+    ///
+    /// Os que passam de `r3` moram na pilha, e o `arg` lia cada um com um `read_u32` — seis
+    /// empréstimos do mapa de memória e seis buscas de região por chamada de GL, em toda chamada,
+    /// mesmo nas que só usam um argumento. Uma leitura de 24 bytes faz o mesmo; se ela falhar (a
+    /// pilha no fim da região), cai no caminho de um por um, que devolve zero no que não dá.
+    pub(super) fn args_de_gl(&self, base: usize) -> [u32; 10] {
+        let mut a = [0u32; 10];
+        let regs = [Reg::R0, Reg::R1, Reg::R2, Reg::R3];
+        for (i, slot) in a.iter_mut().enumerate() {
+            let indice = base + i;
+            if indice < 4 {
+                *slot = self.cpu.read_reg(regs[indice]);
+            }
+        }
+        let primeiro_da_pilha = 4usize.saturating_sub(base);
+        let quantos = 10 - primeiro_da_pilha;
+        let sp = self.cpu.read_reg(Reg::Sp);
+        let inicio = sp.wrapping_add((base + primeiro_da_pilha - 4) as u32 * 4);
+        let mut bytes = [0u8; 40];
+        if self.cpu.read_mem(inicio, &mut bytes[..quantos * 4]).is_ok() {
+            for k in 0..quantos {
+                let b = &bytes[k * 4..k * 4 + 4];
+                a[primeiro_da_pilha + k] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        } else {
+            for k in 0..quantos {
+                a[primeiro_da_pilha + k] = self.arg(base + primeiro_da_pilha + k);
+            }
+        }
+        a
+    }
+
     pub(super) fn arg(&self, index: usize) -> u32 {
         match index {
             0 => self.cpu.read_reg(Reg::R0),

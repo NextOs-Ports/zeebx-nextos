@@ -1855,6 +1855,146 @@ struct PendingSurfaceBlit {
 /// A lista abaixo é de exclusão, e não de inclusão, de propósito: esquecer um método que
 /// desenha aqui daria pixel errado, que é difícil de perceber; deixar de fora um que não
 /// desenha só custa a cópia, que é visível na medição. Na dúvida, copia.
+/// Os métodos que o atalho de API atende sem sair do JIT ([`Machine::atende_por_dentro`]).
+///
+/// **Só métodos que nunca entram no guest**: o `Run` do Dynarmic não é reentrante, e um
+/// `call_guest` daqui dentro volta com erro (ver `DynarmicCpu::run`). Conferido método a
+/// método: nenhum destes chama `call_guest`/`execute` direto — os que precisam do guest
+/// (o `BltIn` de uma superfície do jogo, os avisos de imagem, o `qsort`) passam pelas filas de
+/// pendências, e o atalho devolve a vez quando a fila não está vazia. O resto (o `IShell`, os
+/// eventos, os temporizadores, o EGL com a troca de quadro) continua pelo caminho de sempre.
+///
+/// A lista nasceu da medição: o Pac-Mania faz 11 mil `GetClipRect`, 5,6 mil `SetClipRect` e 2,8
+/// mil pares `SetParm`/`Draw` por quadro no Mali-450; o GL é o grosso dos jogos 3D.
+fn atende_por_dentro_permitido(iface: Interface, slot: u32) -> bool {
+    static TABELA: std::sync::OnceLock<Vec<(Interface, Vec<bool>)>> = std::sync::OnceLock::new();
+    let tabela = TABELA.get_or_init(|| {
+        let por_nome: [(Interface, &[&str]); 5] = [
+            (
+                Interface::Display,
+                &[
+                    "GetClipRect",
+                    "SetClipRect",
+                    "SetColor",
+                    "BitBlt",
+                    "DrawRect",
+                    "FillRect",
+                    "GetFontMetrics",
+                    "MeasureTextEx",
+                    "DrawText",
+                    "SetFont",
+                ],
+            ),
+            (
+                Interface::Bitmap,
+                &[
+                    "RGBToNative",
+                    "NativeToRGB",
+                    "DrawPixel",
+                    "GetPixel",
+                    "GetInfo",
+                    "FillRect",
+                    "SetTransparencyColor",
+                    "GetTransparencyColor",
+                ],
+            ),
+            (
+                Interface::Image,
+                &["SetParm", "Draw", "DrawFrame", "GetInfo"],
+            ),
+            (
+                Interface::Helpers,
+                &[
+                    "memcpy",
+                    "memmove",
+                    "memset",
+                    "memcmp",
+                    "strlen",
+                    "strcmp",
+                    "strncmp",
+                    "strcpy",
+                    "strncpy",
+                    "strcat",
+                    "wstrlen",
+                    "wstrcpy",
+                    "wstrcmp",
+                    "malloc",
+                    "free",
+                    "realloc",
+                    "dbgprintf",
+                    "aee_GetTimeMS",
+                    "aee_GetUpTimeMS",
+                    "aee_GetSeconds",
+                ],
+            ),
+            (Interface::Gles, &[]),
+        ];
+        let mut tabela: Vec<(Interface, Vec<bool>)> = por_nome
+            .iter()
+            .map(|(i, nomes)| {
+                let mut slots = Vec::new();
+                let mut s = 0;
+                while let Some(nome) = i.method(s) {
+                    slots.push(nomes.contains(&nome));
+                    s += 1;
+                }
+                (*i, slots)
+            })
+            .collect();
+        // O GL inteiro: o `gles_call` desenha, lê e escreve memória do jogo, e nunca o chama.
+        for i in [Interface::Gles, Interface::GlLegacy] {
+            let mut slots = Vec::new();
+            let mut s = 0;
+            while let Some(nome) = i.method(s) {
+                slots.push(!nome.is_empty());
+                s += 1;
+            }
+            tabela.retain(|(j, _)| *j != i);
+            tabela.push((i, slots));
+        }
+        tabela
+    });
+    tabela
+        .iter()
+        .find(|(i, _)| *i == iface)
+        .is_some_and(|(_, slots)| slots.get(slot as usize).copied().unwrap_or(false))
+}
+
+/// [`touches_whole_surface`] por interface e slot, calculado uma vez.
+///
+/// A lista de exclusão é uma cascata de comparações de texto, e ela rodava em toda chamada de
+/// `IImage`, `IDisplay`, `IBitmap`, `IGraphics`: no Pac-Mania, que faz milhares de desenhos por
+/// quadro, `touches_whole_surface` e o `Interface::method` que o alimenta pesavam 2,1% do
+/// processador no Mali-450. A resposta só depende do nome, e o nome só do par.
+fn toca_a_superficie_inteira(iface: Interface, slot: u32) -> bool {
+    static TABELA: std::sync::OnceLock<Vec<(Interface, Vec<bool>)>> = std::sync::OnceLock::new();
+    let tabela = TABELA.get_or_init(|| {
+        [
+            Interface::Graphics,
+            Interface::Display,
+            Interface::Bitmap,
+            Interface::Transform,
+            Interface::Canvas,
+            Interface::Image,
+        ]
+        .into_iter()
+        .map(|i| {
+            let mut slots = Vec::new();
+            let mut s = 0;
+            while let Some(nome) = i.method(s) {
+                slots.push(touches_whole_surface(nome));
+                s += 1;
+            }
+            (i, slots)
+        })
+        .collect()
+    });
+    match tabela.iter().find(|(i, _)| *i == iface) {
+        Some((_, slots)) => slots.get(slot as usize).copied().unwrap_or(true),
+        None => iface.method(slot).is_none_or(touches_whole_surface),
+    }
+}
+
 fn touches_whole_surface(name: &str) -> bool {
     !matches!(
         name,
@@ -2525,6 +2665,12 @@ pub struct Machine<C: CpuBackend> {
     media: HashMap<u32, MediaState>,
     /// Ver `poll_media`: antes deste instante do relógio virtual não vale varrer as mídias.
     proxima_varredura_de_midia: u64,
+    /// `(começo, teto, orçamento)` do trecho que o [`Machine::execute`] está rodando agora, para o
+    /// atalho de API renovar a fatia como o laço renovaria. Ver [`Machine::atende_por_dentro`].
+    trecho_do_atalho: (u64, u64, u64),
+    /// Uma chamada que o atalho começou e não pôde concluir (API que falta, erro do núcleo): o
+    /// laço de fora a termina como terminaria uma chamada comum.
+    saida_do_atalho: Option<(u32, Result<Option<u32>, CpuError>)>,
     /// Os sons entregues aos `IMedia`, já lidos, pela chave do conteúdo. Ver
     /// [`CargaDeMidia`].
     cargas_de_midia: HashMap<u64, CargaDeMidia>,
@@ -2661,7 +2807,7 @@ pub struct Machine<C: CpuBackend> {
     #[cfg(feature = "soundfont")]
     banco_de_som: Option<std::sync::Arc<crate::audio::soundfont::Banco>>,
     /// Quantas vezes cada método foi chamado — o retrato do que o jogo usa.
-    calls: rustc_hash::FxHashMap<(u32, u32), u64>,
+    calls: Vec<Vec<u64>>,
     /// Total de chamadas atendidas, para aplicar o teto.
     calls_total: u64,
     /// Se o quadro **de agora** deve pular o desenho — 3D e a limpeza de tela, não a lógica.
@@ -3066,6 +3212,8 @@ impl<C: CpuBackend> Machine<C> {
             egl_context: 0,
             media: HashMap::new(),
             proxima_varredura_de_midia: 0,
+            trecho_do_atalho: (0, 0, 0),
+            saida_do_atalho: None,
             cargas_de_midia: HashMap::new(),
             audio: None,
             gl_last_frame: Vec::new(),
@@ -3262,7 +3410,33 @@ impl<C: CpuBackend> Machine<C> {
                 self.anota_trecho_interrompido(pc);
                 return Ok(Outcome::Budget);
             }
-            match self.cpu.run(pc, fatia)? {
+            self.trecho_do_atalho = (comeco, teto, budget);
+            match Self::roda_com_atalho(self, pc, fatia)? {
+                // O atalho atendeu chamadas por dentro do JIT e devolveu a vez: o `pc` e o `r0`
+                // já são os de depois da chamada, e falta o que este laço faz na fronteira.
+                StopReason::ApiAtendida => {
+                    if let Some((addr, resultado)) = self.saida_do_atalho.take() {
+                        match resultado? {
+                            Some(result) => {
+                                self.cpu.write_reg(Reg::R0, result);
+                                pc = self.cpu.read_reg(Reg::Lr);
+                            }
+                            None => {
+                                let caller = self.cpu.read_reg(Reg::Lr);
+                                self.missing_apis
+                                    .insert(format!("{} (de {caller:#010x})", aee::describe(addr)));
+                                return Ok(Outcome::Unimplemented {
+                                    addr,
+                                    args: self.args(),
+                                    caller,
+                                });
+                            }
+                        }
+                    } else {
+                        pc = self.cpu.read_reg(Reg::Pc) | u32::from(self.cpu.em_thumb());
+                    }
+                    self.run_pending_callbacks(budget)?;
+                }
                 StopReason::ApiCall { addr } if self.calls_total >= MAX_CALLS => {
                     let _ = addr;
                     return Ok(Outcome::CallLimit {
@@ -3341,6 +3515,82 @@ impl<C: CpuBackend> Machine<C> {
         }
     }
 
+    /// O `cpu.run` com o atalho de API armado para este `Machine`.
+    ///
+    /// Fora de linha e por ponteiro cru de propósito: a callback do atalho volta a este
+    /// `Machine` por esse ponteiro enquanto o `run` está no meio, e o compilador precisa tratar o
+    /// `Machine` inteiro como alterado pela chamada — nada de um campo lido antes do `run`
+    /// valendo depois dele.
+    #[inline(never)]
+    fn roda_com_atalho(this: *mut Self, pc: u32, fatia: u64) -> Result<StopReason, CpuError> {
+        // `ZEEBX_SEM_ATALHO=1` volta ao caminho antigo (toda chamada sai do JIT), para medir e
+        // para comparar as duas execuções quadro a quadro.
+        static DESLIGADO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DESLIGADO.get_or_init(|| std::env::var_os("ZEEBX_SEM_ATALHO").is_some()) {
+            return unsafe { (*this).cpu.run(pc, fatia) };
+        }
+        unsafe {
+            let atalho = crate::cpu::AtalhoDeApi {
+                funcao: Self::atende_por_dentro,
+                contexto: this.cast(),
+            };
+            (*this).cpu.define_atalho(Some(atalho));
+            let parada = (*this).cpu.run(pc, fatia);
+            (*this).cpu.define_atalho(None);
+            parada
+        }
+    }
+
+    /// O atendimento de uma chamada de API **de dentro** do `run` do JIT. Ver
+    /// [`CpuBackend::define_atalho`].
+    ///
+    /// Faz o que o laço do [`Machine::execute`] faria na chamada: despacha, põe o resultado em
+    /// `r0`, volta ao `lr` e renova a fatia. O que ele não pode fazer daqui — entrar no guest
+    /// para callbacks pendentes, varrer as mídias (o aviso de fim chama o guest) — vira
+    /// [`Atendimento::AtendidoSai`], e o laço de fora faz na mesma fronteira de antes.
+    ///
+    /// Só atende o que está em [`atende_por_dentro_permitido`]: métodos que não entram no guest.
+    ///
+    /// # Safety
+    /// `contexto` é o `Machine` que armou o atalho em [`Machine::roda_com_atalho`], parado dentro
+    /// do `cpu.run`.
+    unsafe fn atende_por_dentro(contexto: *mut (), addr: u32) -> crate::cpu::Atendimento {
+        use crate::cpu::Atendimento;
+        let m = unsafe { &mut *contexto.cast::<Self>() };
+        if m.calls_total >= MAX_CALLS || m.tracing {
+            return Atendimento::Recusado;
+        }
+        let Some((iface, slot)) = aee::decode(addr) else {
+            return Atendimento::Recusado;
+        };
+        if !atende_por_dentro_permitido(iface, slot) {
+            return Atendimento::Recusado;
+        }
+        let result = match m.dispatch(addr) {
+            Ok(Some(result)) => result,
+            outro => {
+                m.saida_do_atalho = Some((addr, outro));
+                return Atendimento::AtendidoSai;
+            }
+        };
+        m.cpu.write_reg(Reg::R0, result);
+        let lr = m.cpu.read_reg(Reg::Lr);
+        m.cpu.retoma_em(lr);
+        let (comeco, teto, orcamento) = m.trecho_do_atalho;
+        let gasto = m.cpu.instructions().saturating_sub(comeco);
+        let fatia = teto.saturating_sub(gasto).min(orcamento);
+        let pendente = !m.pending_calls.is_empty()
+            || !m.pending_probes.is_empty()
+            || !m.pending_blits.is_empty()
+            || !m.pending_surface_blits.is_empty()
+            || m.midia_quer_varredura();
+        if fatia == 0 || pendente {
+            return Atendimento::AtendidoSai;
+        }
+        m.cpu.renova_fatia(fatia);
+        Atendimento::Atendido
+    }
+
     /// Guarda onde continuar o trecho que o teto de instruções interrompeu.
     ///
     /// **Só o trecho mais de fora.** O guest guarda o estado dele nos registradores e na pilha
@@ -3386,7 +3636,17 @@ impl<C: CpuBackend> Machine<C> {
         let Some((iface, slot)) = aee::decode(addr) else {
             return Ok(None);
         };
-        *self.calls.entry((iface as u32, slot)).or_insert(0) += 1;
+        // Contagem numa tabela por interface e slot: o mapa por hash custava um `hash_one` por
+        // chamada (0,9% do processador no Pac-Mania, que faz milhares por quadro).
+        let linha = iface as usize;
+        if self.calls.len() <= linha {
+            self.calls.resize_with(linha + 1, Vec::new);
+        }
+        let contagens = &mut self.calls[linha];
+        if contagens.len() <= slot as usize {
+            contagens.resize(slot as usize + 1, 0);
+        }
+        contagens[slot as usize] += 1;
         self.calls_total += 1;
         self.note_spin(iface, slot);
         let traced = self.tracing
@@ -3662,7 +3922,7 @@ impl<C: CpuBackend> Machine<C> {
             | (Interface::Bitmap, _)
             | (Interface::Transform, _)
             | (Interface::Canvas, _) => {
-                let whole = iface.method(slot).is_none_or(touches_whole_surface);
+                let whole = toca_a_superficie_inteira(iface, slot);
                 if whole {
                     self.sync_surfaces_in()?;
                 }
@@ -3737,7 +3997,7 @@ impl<C: CpuBackend> Machine<C> {
                 // 168 mil `Draw` em cinco segundos virtuais, um par por sprite; cobrar a
                 // superfície inteira de cada `SetParm` — que não põe um pixel na tela — eram 52
                 // segundos de relógio, metade de tudo que o emulador gastava atendendo o jogo.
-                let whole = iface.method(slot).is_none_or(touches_whole_surface);
+                let whole = toca_a_superficie_inteira(iface, slot);
                 if whole {
                     self.sync_surfaces_in()?;
                 }

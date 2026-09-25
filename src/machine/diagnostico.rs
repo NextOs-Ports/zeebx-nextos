@@ -212,8 +212,19 @@ impl<C: CpuBackend> Machine<C> {
 
     /// Quantas vezes cada método foi chamado, em ordem — o backlog de APIs, medido.
     pub fn call_log(&self) -> Vec<(String, u64)> {
-        // O mapa é por hash (é tocado em toda chamada de API); a ordem sai daqui.
-        let mut chaves: Vec<_> = self.calls.iter().map(|(&k, &v)| (k, v)).collect();
+        // A tabela é por interface e slot (é tocada em toda chamada de API); a ordem sai daqui.
+        let mut chaves: Vec<((u32, u32), u64)> = self
+            .calls
+            .iter()
+            .enumerate()
+            .flat_map(|(iface, slots)| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &n)| n > 0)
+                    .map(move |(slot, &n)| ((iface as u32, slot as u32), n))
+            })
+            .collect();
         chaves.sort_unstable();
         chaves
             .into_iter()

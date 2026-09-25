@@ -909,6 +909,16 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     /// Enfileira o aviso de fim dos sons que já terminaram.
+    /// Se o [`Machine::poll_media`] varreria as mídias agora. O atalho de API pergunta isto
+    /// para devolver a vez ao laço de fora quando a varredura vale (ela pode chamar o guest).
+    pub(super) fn midia_quer_varredura(&self) -> bool {
+        if self.media.is_empty() {
+            return false;
+        }
+        let now = self.now_us();
+        !(now < self.proxima_varredura_de_midia && self.proxima_varredura_de_midia - now <= 1000)
+    }
+
     pub(super) fn poll_media(&mut self) -> Result<(), CpuError> {
         // Roda em toda chamada de API: quase sempre nada terminou, e a pergunta não pode custar
         // uma alocação (5,9% do processador no Pac-Mania no Mali-450).

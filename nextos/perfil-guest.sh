@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
 export CARGO_TARGET_DIR=/home/felipe/zeebx-nextos/target
-flock /home/felipe/zeebx-nextos/.build.lock cargo build --release --locked -p zeebx-classical-standalone --features zeebx/perfil-guest >&2
+flock /home/felipe/zeebx-nextos/.build.lock sh -c 'find src frontends/classical-standalone/src -type f -exec touch {} + ; exec cargo build --release --locked -p zeebx-classical-standalone --features zeebx/perfil-guest' >&2
 BIN=$CARGO_TARGET_DIR/release/zeebx
 cp "$BIN" "${4:-/tmp}/zeebx-perfil-guest.$$"
 cd "${4:-/tmp}"

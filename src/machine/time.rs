@@ -16,6 +16,21 @@ impl<C: CpuBackend> Machine<C> {
     /// Qualquer outra chamada é sinal de trabalho e zera a contagem, então um quadro que lê o
     /// relógio no meio do que faz continua custando o que custa.
     pub(super) fn note_spin(&mut self, iface: Interface, slot: u32) {
+        // Só estas interfaces têm leitura de relógio, cessão de vez ou chamada neutra; qualquer
+        // outra é trabalho e zera a contagem. Decidir pela interface antes de buscar o nome do
+        // método poupa a comparação de textos nas milhares de chamadas de desenho por quadro
+        // (no Pac-Mania, `Interface::method` vindo daqui pesava 1,3% do processador).
+        if !matches!(
+            iface,
+            Interface::Helpers
+                | Interface::Thread
+                | Interface::Shell
+                | Interface::HidDevice
+                | Interface::Hid
+        ) {
+            self.spin_polls = 0;
+            return;
+        }
         let name = iface.method(slot).unwrap_or("");
         let reads_clock = iface == Interface::Helpers
             && matches!(name, "aee_GetTimeMS" | "aee_GetUpTimeMS" | "aee_GetSeconds");

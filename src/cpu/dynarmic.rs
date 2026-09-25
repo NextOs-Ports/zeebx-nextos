@@ -13,7 +13,7 @@ use dynarmic::a32::{ArchVersion, Callbacks, Dynarmic as Jit, VAddr};
 use dynarmic::{CallbackImpl, GuestInt, HaltReason};
 
 use super::mem::GuestMemory;
-use super::{API_BASE, API_SIZE, RETURN_MAGIC};
+use super::{API_BASE, API_SIZE, AtalhoDeApi, Atendimento, RETURN_MAGIC};
 use super::{CpuBackend, CpuError, Reg, StopReason};
 
 /// `CPSR` de modo usuário do ARM. A extensão da Superscape confere este campo antes de tocar
@@ -48,6 +48,8 @@ enum Parada {
     Fetch(u32),
     Memoria(u32),
     Excecao(u32),
+    /// O atalho de API pediu para devolver a vez ao laço de fora. Ver [`StopReason::ApiAtendida`].
+    Continua,
 }
 
 /// As páginas do guest que já foram buscadas como código, um bit por página.
@@ -178,12 +180,59 @@ struct Estado {
     limite: Cell<u64>,
     parada: Cell<Parada>,
     jit: Cell<*mut Jit<Estado>>,
+    /// Quem atende chamada de API sem sair do JIT. Ver [`CpuBackend::define_atalho`].
+    atalho_api: Cell<Option<AtalhoDeApi>>,
+    /// Se o atalho está rodando agora: o `Run` do Dynarmic não é reentrante, e nada chamado de
+    /// dentro dele pode entrar no guest de novo.
+    na_callback: Cell<bool>,
+    /// O atalho mexeu no cache de código (escrita da API numa página executada): o `Run` precisa
+    /// sair para o Dynarmic aplicar a invalidação, e o laço de fora retoma.
+    sair_depois: Cell<bool>,
     /// A tabela de páginas do Dynarmic: `PAGINAS` ponteiros, o início de cada página no host, ou
     /// nulo para a página que precisa passar pelas callbacks. Ver [`DynarmicCpu::tabela`].
     tabela: *mut *mut u8,
 }
 
 impl Estado {
+    /// A chamada de API em `pc` atendida sem sair do `Run`. `true` quando foi atendida (e o guest
+    /// segue, ou para com [`Parada::Continua`]); `false` para o caminho de sempre.
+    ///
+    /// **Por que dá para continuar daqui.** O bloco que o Dynarmic monta para um endereço sem
+    /// código é `BranchWritePC(pc+4); ExceptionRaised; CheckHalt{ReturnToDispatch}`: os
+    /// registradores do guest estão todos no estado da CPU quando esta callback roda, e depois
+    /// dela o despachante do Dynarmic busca o bloco do `pc` que estiver no estado. O atalho
+    /// escreve `r0` e troca o `pc` pelo `lr` (com o bit T), e o guest volta ao chamador como se
+    /// tivesse saído e entrado de novo. O relógio também fecha: o `AddTicks` vem antes desta
+    /// callback, e o `GetTicksRemaining` depois dela lê o teto que o atalho renovou.
+    ///
+    /// Recusa quando há código sujo à espera: a invalidação só acontece fora do `Run`, e o
+    /// contrato de sempre é que escrita em código vale a partir da próxima chamada de API.
+    fn atende_por_dentro(cb: &CallbackImpl<Self>, pc: u32) -> bool {
+        let Some(atalho) = cb.atalho_api.get() else {
+            return false;
+        };
+        if cb.na_callback.get() || cb.limpa_tudo.get() || !cb.codigo_sujo.borrow().is_empty() {
+            return false;
+        }
+        cb.na_callback.set(true);
+        cb.sair_depois.set(false);
+        // O despachante mexe no estado desta callback por outro caminho (a CPU do `Machine`).
+        // O ponteiro passa por `black_box` para o compilador não guardar nada dele atravessando
+        // a chamada.
+        let cb = std::hint::black_box(cb as *const CallbackImpl<Self>);
+        let resposta = unsafe { (atalho.funcao)(atalho.contexto, pc) };
+        let cb = unsafe { &*std::hint::black_box(cb) };
+        cb.na_callback.set(false);
+        match resposta {
+            Atendimento::Recusado => false,
+            Atendimento::Atendido if !cb.sair_depois.get() => true,
+            Atendimento::Atendido | Atendimento::AtendidoSai => {
+                Self::para(cb, Parada::Continua);
+                true
+            }
+        }
+    }
+
     /// Tira a página da tabela: dali em diante leitura e escrita nela passam pelas callbacks.
     fn anula_pagina(&self, pagina: u32) {
         if (pagina as usize) < PAGINAS {
@@ -421,6 +470,11 @@ impl Callbacks for Estado {
         // callback já ter registrado o fetch. Não sobrescrevê-lo é o que mantém a fronteira
         // das vtables BREW distinguível de uma instrução realmente inválida.
         if cb.parada.get() == Parada::Nenhuma {
+            if (API_BASE..API_BASE.saturating_add(API_SIZE)).contains(&pc)
+                && Self::atende_por_dentro(cb, pc)
+            {
+                return;
+            }
             // A binding atual transforma `optional<u32>::none()` do fetch em
             // `NoExecuteFault` antes de devolver o controle. A faixa das APIs e o sentinela
             // nunca contêm código por definição, então ainda dá para classificá-los aqui sem
@@ -451,6 +505,13 @@ pub struct DynarmicCpu {
     /// com vigia de escrita (superfícies e buffers que o emulador precisa ver sujos) e a última
     /// página de uma região que não a completa.
     tabela: Box<[*mut u8]>,
+    /// **Os registradores do guest, sem ida ao C++.** O `Jit::Regs()` do Dynarmic devolve uma
+    /// referência para o estado da CPU, que vive no `Impl` alocado uma vez e não se move depois do
+    /// `reset`. Cada `get_reg`/`set_reg` da binding era uma chamada `JitA32_Regs` fora de linha, e
+    /// o despacho de uma API lê e escreve vários registradores: no Pac-Mania, que faz milhares de
+    /// chamadas por quadro, `Regs()` e `JitA32_Regs` somavam 1,9% do processador no Mali-450.
+    /// Nulo antes do `reset`.
+    regs: *mut u32,
 }
 
 impl DynarmicCpu {
@@ -460,7 +521,30 @@ impl DynarmicCpu {
             semihosting: Default::default(),
             jit: None,
             tabela: vec![std::ptr::null_mut(); PAGINAS].into_boxed_slice(),
+            regs: std::ptr::null_mut(),
         })
+    }
+
+    /// O bit T do estado da CPU, direto no `upper_location_descriptor` do `A32JitState` do
+    /// backend AArch64 (que vem logo depois dos 16 registradores, e o próprio Dynarmic confere
+    /// isso com um `static_assert` em `EmitA32Terminal(PopRSBHint)`). `Cpsr()`/`SetCpsr()`
+    /// remontam o CPSR inteiro campo a campo, e o `run` fazia os dois a cada volta do JIT —
+    /// uma por chamada de API.
+    #[cfg(target_arch = "aarch64")]
+    fn modo_thumb_direto(&mut self, thumb: bool) -> bool {
+        if self.regs.is_null() {
+            return false;
+        }
+        unsafe {
+            let uld = self.regs.add(16);
+            *uld = (*uld & !1) | u32::from(thumb);
+        }
+        true
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn modo_thumb_direto(&mut self, _thumb: bool) -> bool {
+        false
     }
 
     /// Recoloca na tabela as páginas de `[inicio, fim)` que nada mais precisa interceptar.
@@ -525,12 +609,23 @@ impl DynarmicCpu {
             return;
         };
         jit.marca_codigo_sujo(addr, len);
+        // Dentro do atalho de API o `Run` ainda está de pé: o Dynarmic aceita o pedido de
+        // invalidação e para o `Run` sozinho, e o laço de fora retoma depois dele.
+        if jit.na_callback.get() && (jit.limpa_tudo.get() || !jit.codigo_sujo.borrow().is_empty())
+        {
+            jit.sair_depois.set(true);
+        }
         if jit.limpa_tudo.replace(false) {
             if crate::video::gpu::mede::ligado() {
                 conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             jit.codigo_sujo.borrow_mut().clear();
             jit.clear_cache();
+        }
+        // Quase sempre vazio: tomar e percorrer um `BTreeSet` vazio ainda custava 2,6% do
+        // processador no Pac-Mania (uma vez por escrita da API e por volta do JIT).
+        if jit.codigo_sujo.borrow().is_empty() {
+            return;
         }
         let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
         for linha in linhas {
@@ -585,6 +680,9 @@ impl CpuBackend for DynarmicCpu {
             limite: Cell::new(0),
             parada: Cell::new(Parada::Nenhuma),
             jit: Cell::new(std::ptr::null_mut()),
+            atalho_api: Cell::new(None),
+            na_callback: Cell::new(false),
+            sair_depois: Cell::new(false),
             tabela: self.tabela.as_mut_ptr(),
         };
         let mut config = Jit::<Estado>::new_config();
@@ -597,22 +695,53 @@ impl CpuBackend for DynarmicCpu {
         let ptr = &mut *jit as *mut Jit<Estado>;
         jit.jit.set(ptr);
         jit.set_cpsr(MODO_USUARIO);
+        self.regs = jit.get_regs().as_ptr().cast_mut();
         self.jit = Some(jit);
         Ok(())
     }
 
+    #[inline]
     fn read_reg(&self, reg: Reg) -> u32 {
-        self.jit().map_or(0, |jit| jit.get_reg(Self::indice(reg)))
+        if self.regs.is_null() {
+            return 0;
+        }
+        // Ver [`DynarmicCpu::regs`]: aponta para os 16 registradores do estado da CPU.
+        unsafe { *self.regs.add(Self::indice(reg)) }
     }
 
+    #[inline]
     fn write_reg(&mut self, reg: Reg, value: u32) {
-        if let Ok(jit) = self.jit_mut() {
-            jit.set_reg(Self::indice(reg), value);
+        if !self.regs.is_null() {
+            unsafe { *self.regs.add(Self::indice(reg)) = value };
         }
     }
 
     fn instructions(&self) -> u64 {
         self.jit().map_or(0, |jit| jit.instrucoes.get())
+    }
+
+    fn define_atalho(&mut self, atalho: Option<AtalhoDeApi>) {
+        if let Ok(jit) = self.jit_mut() {
+            jit.atalho_api.set(atalho);
+        }
+    }
+
+    fn retoma_em(&mut self, pc: u32) {
+        self.write_reg(Reg::Pc, pc & !1);
+        if !self.modo_thumb_direto(pc & 1 == 1) {
+            let cpsr = self.cpsr();
+            self.set_cpsr(match pc & 1 {
+                1 => cpsr | CPSR_THUMB,
+                _ => cpsr & !CPSR_THUMB,
+            });
+        }
+    }
+
+    fn renova_fatia(&mut self, max_instructions: u64) {
+        if let Ok(jit) = self.jit_mut() {
+            jit.limite
+                .set(jit.instrucoes.get().saturating_add(max_instructions));
+        }
     }
 
     fn set_instructions(&mut self, valor: u64) {
@@ -743,22 +872,34 @@ impl CpuBackend for DynarmicCpu {
     }
 
     fn run(&mut self, pc: u32, max_instructions: u64) -> Result<StopReason, CpuError> {
-        let jit = self.jit_mut()?;
+        // O `Run` do Dynarmic não é reentrante: uma API atendida pelo atalho que precisasse entrar
+        // no guest cairia aqui. As que o atalho aceita não fazem isso; se alguma passar a fazer,
+        // o erro aparece em vez de corromper o estado do JIT.
+        if self.jit()?.na_callback.get() {
+            return Err(CpuError(
+                "chamada de API atendida por dentro do JIT tentou entrar no guest".into(),
+            ));
+        }
         // **O bit 0 do endereço é o modo, não parte do endereço.** O despachante retoma no `lr`
         // do jeito que ele veio, e o `lr` de uma chamada feita de código Thumb traz o bit 0
         // ligado — é a convenção de interworking do ARM. Aqui ela precisa ser explícita:
         // escrevendo o endereço cru, o Zenonia, que é todo Thumb, voltava de cada API um byte
         // adiante e o núcleo parava numa "instrução" montada com metade de duas.
-        let cpsr = jit.get_cpsr();
-        match pc & 1 {
-            1 => jit.set_cpsr(cpsr | CPSR_THUMB),
-            _ => jit.set_cpsr(cpsr & !CPSR_THUMB),
+        let thumb = pc & 1 == 1;
+        if !self.modo_thumb_direto(thumb) {
+            let jit = self.jit_mut()?;
+            let cpsr = jit.get_cpsr();
+            match thumb {
+                true => jit.set_cpsr(cpsr | CPSR_THUMB),
+                false => jit.set_cpsr(cpsr & !CPSR_THUMB),
+            }
         }
-        jit.set_pc(pc & !1);
-        // `HaltExecution` deixa a razão armada para a volta que acabou de sair. O próximo
-        // trecho começa depois de o despachante BREW ter escrito r0/pc, portanto precisa limpar
-        // o bit genérico antes de entrar novamente no JIT.
-        jit.clear_halt(HaltReason::UserDefined1);
+        self.write_reg(Reg::Pc, pc & !1);
+        let jit = self.jit_mut()?;
+        // **Não há `ClearHalt` aqui.** O `HaltExecution` de [`Estado::para`] só acontece dentro do
+        // `Run`, e a saída do `Run` (o `return_from_run_code` do prelúdio) já troca o
+        // `halt_reason` por zero atomicamente antes de devolver. Limpar de novo era uma chamada ao
+        // C++ com barreira de memória por chamada de API, sem efeito.
         jit.parada.set(Parada::Nenhuma);
         jit.limite
             .set(jit.instrucoes.get().saturating_add(max_instructions));
@@ -772,12 +913,16 @@ impl CpuBackend for DynarmicCpu {
             jit.codigo_sujo.borrow_mut().clear();
             jit.clear_cache();
         }
-        let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
-        for linha in linhas {
-            if crate::video::gpu::mede::ligado() {
-                conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Quase sempre vazio: tomar e percorrer um `BTreeSet` vazio ainda custava 2,6% do
+        // processador no Pac-Mania (uma vez por escrita da API e por volta do JIT).
+        if !jit.codigo_sujo.borrow().is_empty() {
+            let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
+            for linha in linhas {
+                if crate::video::gpu::mede::ligado() {
+                    conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                jit.invalidate_cache_range(linha, LINHA as usize);
             }
-            jit.invalidate_cache_range(linha, LINHA as usize);
         }
         match jit.parada.get() {
             Parada::Nenhuma => Ok(StopReason::Budget),
@@ -793,6 +938,7 @@ impl CpuBackend for DynarmicCpu {
                 pc: jit.get_pc(),
             }),
             Parada::Excecao(pc) => Ok(StopReason::Exception { pc }),
+            Parada::Continua => Ok(StopReason::ApiAtendida),
         }
     }
 }

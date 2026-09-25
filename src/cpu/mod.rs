@@ -48,6 +48,32 @@ pub enum StopReason {
     Exception { pc: u32 },
     /// Estourou o orçamento de instruções da fatia.
     Budget,
+    /// O backend atendeu uma ou mais chamadas de API **sem sair do código recompilado** (ver
+    /// [`CpuBackend::define_atalho`]) e devolveu a vez porque há algo que só o laço de fora faz:
+    /// callbacks pendentes, invalidação de código, fim da fatia, ou uma chamada que o atalho não
+    /// pôde concluir (ver `Machine::saida_do_atalho`). A execução continua no `pc` atual.
+    ApiAtendida,
+}
+
+/// Como o atalho de API respondeu a uma chamada. Ver [`CpuBackend::define_atalho`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Atendimento {
+    /// Não atendeu: o backend para como sempre, com [`StopReason::ApiCall`].
+    Recusado,
+    /// Atendeu, `r0` e o `pc` de volta já estão escritos; o guest segue sem sair do JIT.
+    Atendido,
+    /// Atendeu (ou tentou), mas o laço de fora precisa rodar antes: [`StopReason::ApiAtendida`].
+    AtendidoSai,
+}
+
+/// Quem atende uma chamada de API de dentro do backend: uma função e o contexto dela.
+///
+/// O contexto é um ponteiro cru para o despachante (o `Machine`), e a função só pode ser chamada
+/// enquanto ele está parado dentro de [`CpuBackend::run`] — é o próprio `run` quem a chama.
+#[derive(Debug, Clone, Copy)]
+pub struct AtalhoDeApi {
+    pub funcao: unsafe fn(*mut (), u32) -> Atendimento,
+    pub contexto: *mut (),
 }
 
 pub trait CpuBackend {
@@ -152,6 +178,32 @@ pub trait CpuBackend {
     /// bitmap de destino, e sem este aviso a superfície nunca importava a cópia — o palco ficava
     /// cinza.
     fn marca_sujo(&mut self, _addr: u32, _len: u32) {}
+
+    /// Arma (ou desarma, com `None`) o atendimento de API por dentro do `run`.
+    ///
+    /// **Cada chamada de API era uma saída e uma volta do código recompilado.** O Pac-Mania faz
+    /// 22 mil chamadas por quadro no Mali-450 (`GetClipRect`, `SetClipRect`, `SetParm`, `Draw`),
+    /// e cada uma desmontava o `Run` do Dynarmic (prelúdio, relógio, FPCR, busca do bloco) e o
+    /// laço do despachante. Com o atalho, o backend chama o despachante de dentro da callback
+    /// que já recebe o salto para a faixa das vtables, e o guest segue no mesmo `Run`.
+    ///
+    /// O padrão ignora: um backend sem atalho continua parando em [`StopReason::ApiCall`].
+    fn define_atalho(&mut self, _atalho: Option<AtalhoDeApi>) {}
+
+    /// Dentro do atalho: o guest volta para `pc` (bit 0 = Thumb), como no `run`.
+    fn retoma_em(&mut self, pc: u32) {
+        self.write_reg(Reg::Pc, pc & !1);
+        let cpsr = self.cpsr();
+        self.set_cpsr(match pc & 1 {
+            1 => cpsr | (1 << 5),
+            _ => cpsr & !(1 << 5),
+        });
+    }
+
+    /// Dentro do atalho: o teto da fatia recomeça, como recomeçava a cada `run` depois de uma
+    /// chamada de API. Sem isto a fatia valeria para o trecho inteiro, e o jogo que chama muita
+    /// API numa volta devolveria a vez (`Outcome::Budget`) mais cedo que antes.
+    fn renova_fatia(&mut self, _max_instructions: u64) {}
 
     fn read_mem(&self, addr: u32, buf: &mut [u8]) -> Result<(), CpuError>;
 
