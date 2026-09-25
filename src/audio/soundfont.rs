@@ -289,6 +289,7 @@ pub fn toca(banco: &Banco, bytes: &[u8], taxa: u32) -> Option<Sound> {
         if elapsed.as_secs_f64() > 0.0 { comprimento / elapsed.as_secs_f64() } else { 0.0 }
     );
     Some(Sound {
+        tardio: None,
         rate: taxa,
         channels: 1,
         samples: amostras,

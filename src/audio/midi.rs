@@ -669,6 +669,38 @@ impl Voz {
 ///
 /// Devolve o mesmo [`Sound`](crate::audio::wav::Sound) que o WAVE e o MP3 produzem — o misturador não
 /// precisa saber que aqui não havia som nenhum, só partitura.
+/// Como [`decode`], mas devolve na hora um som com a duração certa e sintetiza as amostras numa
+/// thread à parte.
+///
+/// **Por que existe.** A síntese inteira roda de uma vez quando o jogo carrega a música: no
+/// Mali-450 (A53 a 1,0 GHz), 49 s de trilha do RE4 levaram 1,57 s — o jogo parava esse tempo a
+/// cada troca de música. Aqui o total de quadros sai da partitura, que é barata de ler, e o
+/// misturador segura a voz em silêncio, na posição zero, até as amostras chegarem.
+pub fn decode_em_segundo_plano(data: &[u8]) -> Option<crate::audio::wav::Sound> {
+    let partitura = le(data)?;
+    let eventos = partitura.no_tempo();
+    let fim = eventos.last()?.0.min(MAX_SEGUNDOS);
+    let total = ((fim + 0.5) * f64::from(RATE)) as usize + 1;
+    let celula = std::sync::Arc::new(std::sync::OnceLock::new());
+    let destino = celula.clone();
+    let bytes = data.to_vec();
+    let lancou = std::thread::Builder::new()
+        .name("zeebx-midi".into())
+        .spawn(move || {
+            let amostras = decode(&bytes).map(|som| som.samples).unwrap_or_default();
+            let _ = destino.set(amostras);
+        });
+    if lancou.is_err() {
+        return decode(data);
+    }
+    Some(crate::audio::wav::Sound {
+        rate: RATE,
+        channels: 1,
+        samples: Vec::new(),
+        tardio: Some((total, celula)),
+    })
+}
+
 pub fn decode(data: &[u8]) -> Option<crate::audio::wav::Sound> {
     let partitura = le(data)?;
     let eventos = partitura.no_tempo();
@@ -800,6 +832,7 @@ pub fn decode(data: &[u8]) -> Option<crate::audio::wav::Sound> {
     }
     aplica_ganho_fixo(&mut samples);
     Some(crate::audio::wav::Sound {
+        tardio: None,
         rate: RATE,
         channels: 1,
         samples,
@@ -1502,5 +1535,34 @@ mod tests {
         let divisao = i16::from_be_bytes([0xe7, 40]);
         let eventos = le(&smf(divisao, &uma_nota(69, 250))).unwrap().no_tempo();
         assert!((eventos[1].0 - 0.25).abs() < 1e-6, "{:?}", eventos[1].0);
+    }
+}
+
+#[cfg(test)]
+mod segundo_plano {
+    /// Uma partitura mínima: formato 0, uma trilha, dó central por meia batida.
+    fn partitura() -> Vec<u8> {
+        let trilha: &[u8] = &[
+            0x00, 0x90, 60, 100, // note on
+            0x60, 0x80, 60, 0, // note off depois de 96 ticks
+            0x00, 0xff, 0x2f, 0x00, // fim da trilha
+        ];
+        let mut b = b"MThd\0\0\0\x06\0\0\0\x01\0\x60".to_vec();
+        b.extend_from_slice(b"MTrk");
+        b.extend_from_slice(&(trilha.len() as u32).to_be_bytes());
+        b.extend_from_slice(trilha);
+        b
+    }
+
+    #[test]
+    fn o_som_tardio_termina_igual_ao_sincrono() {
+        let bytes = partitura();
+        let sincrono = super::decode(&bytes).expect("partitura válida");
+        let tardio = super::decode_em_segundo_plano(&bytes).expect("partitura válida");
+        assert_eq!(tardio.frames(), sincrono.frames(), "a duração tem de sair antes da síntese");
+        let (_, celula) = tardio.tardio.as_ref().expect("som tardio");
+        let prontas = celula.wait();
+        assert_eq!(prontas, &sincrono.samples);
+        assert_eq!(tardio.amostras(), Some(sincrono.samples.as_slice()));
     }
 }

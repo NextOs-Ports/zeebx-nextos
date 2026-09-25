@@ -117,14 +117,28 @@ pub struct Sound {
     pub rate: u32,
     pub channels: u16,
     pub samples: Vec<f32>,
+    /// Amostras que chegam depois, sintetizadas noutra thread, com o total de quadros já
+    /// conhecido. Ver [`Sound::amostras`] e `midi::decode_em_segundo_plano`.
+    pub tardio: Option<(usize, std::sync::Arc<std::sync::OnceLock<Vec<f32>>>)>,
 }
 
 impl Sound {
     /// Quantos quadros de áudio o som tem — uma amostra por canal conta como um.
     pub fn frames(&self) -> usize {
+        if let Some((quadros, _)) = &self.tardio {
+            return *quadros;
+        }
         match self.channels {
             0 => 0,
             channels => self.samples.len() / channels as usize,
+        }
+    }
+
+    /// As amostras para tocar, ou `None` enquanto um som tardio ainda está sendo sintetizado.
+    pub fn amostras(&self) -> Option<&[f32]> {
+        match &self.tardio {
+            Some((_, celula)) => celula.get().map(Vec::as_slice),
+            None => Some(&self.samples),
         }
     }
 }
@@ -209,6 +223,7 @@ pub fn parse(data: &[u8]) -> Result<Sound, WavError> {
     };
     if tag == FORMAT_IMA_ADPCM {
         return Ok(Sound {
+            tardio: None,
             rate: rate.max(1),
             channels: channels.max(1),
             samples: decode_ima_adpcm(payload, channels.max(1) as usize, align as usize),
@@ -230,6 +245,7 @@ pub fn parse(data: &[u8]) -> Result<Sound, WavError> {
         other => return Err(WavError::BadDepth(other)),
     };
     Ok(Sound {
+        tardio: None,
         rate: rate.max(1),
         channels: channels.max(1),
         samples,

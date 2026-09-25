@@ -255,6 +255,7 @@ pub fn decode_detalhado(data: &[u8]) -> Result<crate::audio::wav::Sound, String>
         ));
     }
     Ok(crate::audio::wav::Sound {
+        tardio: None,
         rate,
         channels,
         samples,

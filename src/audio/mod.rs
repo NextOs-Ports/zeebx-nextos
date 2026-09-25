@@ -117,9 +117,12 @@ impl Voice {
         let fraction = (self.position - self.position.floor()) as f32;
         // Som mono alimenta os dois canais; som estéreo usa o canal pedido.
         let lane = channel.min(channels - 1);
+        // Som tardio ainda sem amostras: silêncio, e a posição não anda (ver `advance`).
+        let Some(amostras) = self.sound.amostras() else {
+            return 0.0;
+        };
         let at = |frame: usize| -> f32 {
-            self.sound
-                .samples
+            amostras
                 .get(frame.min(frames - 1) * channels + lane)
                 .copied()
                 .unwrap_or(0.0)
@@ -129,6 +132,11 @@ impl Voice {
 
     /// Avança um quadro da placa, tratando o fim do som e a repetição.
     fn advance(&mut self) {
+        // **A música começa do começo quando fica pronta**, em vez de entrar pela metade: um som
+        // tardio que ainda não tem amostras segura a posição em zero.
+        if self.sound.amostras().is_none() {
+            return;
+        }
         self.position += self.step;
         if (self.position as usize) < self.sound.frames() {
             return;
@@ -616,6 +624,7 @@ mod tests {
 
     fn tone(rate: u32, frames: usize) -> Arc<Sound> {
         Arc::new(Sound {
+            tardio: None,
             rate,
             channels: 1,
             samples: (0..frames).map(|_| 1.0).collect(),
@@ -770,6 +779,7 @@ mod tests {
         let rate = 8000;
         let hertz = 1000.0;
         let sound = Arc::new(Sound {
+            tardio: None,
             rate,
             channels: 1,
             samples: (0..rate)
