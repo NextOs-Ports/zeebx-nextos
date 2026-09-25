@@ -1,0 +1,178 @@
+diff -ruN orig/src/dynarmic/backend/arm64/a32_address_space.cpp novo/src/dynarmic/backend/arm64/a32_address_space.cpp
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp	2006-07-23 22:21:28.000000000 -0300
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp	2026-09-25 11:12:58.916834248 -0300
+@@ -306,7 +306,7 @@
+ 
+     prelude_info.return_to_dispatcher = code.xptr<void*>();
+     {
+-        oaknut::Label l_this, l_addr;
++        oaknut::Label l_this, l_addr, l_table;
+ 
+         code.LDAR(Wscratch0, Xhalt);
+         code.CBNZ(Wscratch0, return_from_run_code);
+@@ -316,6 +316,24 @@
+             code.B(LE, return_from_run_code);
+         }
+ 
++        if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            // Zeebx/NextOS: consulta a tabela de despacho rápido antes do C++.
++            // X0 = descritor (PC | parte alta), o mesmo valor de GetLocationDescriptor().
++            oaknut::Label l_miss;
++            static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
++            code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++            code.EOR(X1, X0, X0, LSR, 32);
++            code.EOR(W1, W1, W1, LSR, 16);
++            code.UBFX(X1, X1, 2, fast_dispatch_bits);
++            code.LDR(X2, l_table);
++            code.ADD(X2, X2, X1, LSL, 4);
++            code.LDP(Xscratch0, Xscratch1, X2, 0);
++            code.CMP(Xscratch0, X0);
++            code.B(NE, l_miss);
++            code.BR(Xscratch1);
++            code.l(l_miss);
++        }
++
+         code.LDR(X0, l_this);
+         code.MOV(X1, Xstate);
+         code.LDR(Xscratch0, l_addr);
+@@ -323,7 +341,7 @@
+         code.BR(X0);
+ 
+         const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
+-            return self.GetOrEmit(context.GetLocationDescriptor());
++            return self.GetOrEmitAndCache(context.GetLocationDescriptor());
+         };
+ 
+         code.align(8);
+@@ -331,6 +349,8 @@
+         code.dx(mcl::bit_cast<u64>(this));
+         code.l(l_addr);
+         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
++        code.l(l_table);
++        code.dx(mcl::bit_cast<u64>(fast_dispatch_table.get()));
+     }
+ 
+     prelude_info.return_from_run_code = code.xptr<void*>();
+diff -ruN orig/src/dynarmic/backend/arm64/a32_core.h novo/src/dynarmic/backend/arm64/a32_core.h
+--- a/src/dynarmic/backend/arm64/a32_core.h	2006-07-23 22:21:28.000000000 -0300
++++ b/src/dynarmic/backend/arm64/a32_core.h	2026-09-25 11:12:58.914819379 -0300
+@@ -16,7 +16,7 @@
+ 
+     HaltReason Run(A32AddressSpace& process, A32JitState& thread_ctx, volatile u32* halt_reason) {
+         const auto location_descriptor = thread_ctx.GetLocationDescriptor();
+-        const auto entry_point = process.GetOrEmit(location_descriptor);
++        const auto entry_point = process.GetFast(location_descriptor);
+         return process.prelude_info.run_code(entry_point, &thread_ctx, halt_reason);
+     }
+ 
+diff -ruN orig/src/dynarmic/backend/arm64/address_space.cpp novo/src/dynarmic/backend/arm64/address_space.cpp
+--- a/src/dynarmic/backend/arm64/address_space.cpp	2006-07-23 22:21:28.000000000 -0300
++++ b/src/dynarmic/backend/arm64/address_space.cpp	2026-09-25 11:12:44.165736409 -0300
+@@ -24,7 +24,9 @@
+         : code_cache_size(code_cache_size)
+         , mem(code_cache_size)
+         , code(mem.ptr(), mem.ptr())
+-        , fastmem_manager(exception_handler) {
++        , fastmem_manager(exception_handler)
++        , fast_dispatch_table(new FastDispatchEntry[fast_dispatch_size]) {
++    ClearFastDispatchTable();
+     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
+ 
+     exception_handler.Register(mem, code_cache_size);
+@@ -35,6 +37,13 @@
+ 
+ AddressSpace::~AddressSpace() = default;
+ 
++void AddressSpace::ClearFastDispatchTable() {
++    // Descritor impossível (passo único ligado e PC ímpar): nenhuma consulta casa com ele.
++    for (size_t i = 0; i < fast_dispatch_size; i++) {
++        fast_dispatch_table[i] = FastDispatchEntry{~u64(0), nullptr};
++    }
++}
++
+ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
+     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
+         return iter->second;
+@@ -71,6 +80,10 @@
+ }
+ 
+ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
++    if (!descriptors.empty()) {
++        ClearFastDispatchTable();
++    }
++
+     UnprotectCodeMemory();
+ 
+     for (const auto& descriptor : descriptors) {
+@@ -90,6 +103,7 @@
+ }
+ 
+ void AddressSpace::ClearCache() {
++    ClearFastDispatchTable();
+     block_entries.clear();
+     reverse_block_entries.clear();
+     block_infos.clear();
+diff -ruN orig/src/dynarmic/backend/arm64/address_space.h novo/src/dynarmic/backend/arm64/address_space.h
+--- a/src/dynarmic/backend/arm64/address_space.h	2006-07-23 22:21:28.000000000 -0300
++++ b/src/dynarmic/backend/arm64/address_space.h	2026-09-25 11:12:58.914757812 -0300
+@@ -6,6 +6,7 @@
+ #pragma once
+ 
+ #include <map>
++#include <memory>
+ #include <optional>
+ 
+ #include <mcl/stdint.hpp>
+@@ -45,6 +46,43 @@
+ 
+     void DumpDisassembly() const;
+ 
++    // Zeebx/NextOS: tabela de despacho rápido. O backend arm64 não implementa o FastDispatchHint,
++    // então todo salto indireto (bx rN, ldr pc, blx rN, e todo retorno que o RSB perde) voltava ao
++    // despachante C++ e procurava o bloco no robin_map. No Mali-450 (A53 a 1 GHz) isso era 9% da
++    // CPU no Need for Speed Carbon. A tabela é mapeada direto pelo hash do descritor e consultada
++    // pelo próprio código emitido em `return_to_dispatcher`; só a falha chama o C++.
++    struct FastDispatchEntry {
++        u64 location_descriptor;
++        CodePtr code_ptr;
++    };
++    static constexpr size_t fast_dispatch_bits = 14;
++    static constexpr size_t fast_dispatch_size = size_t(1) << fast_dispatch_bits;
++
++    static u64 FastDispatchIndex(u64 descriptor) {
++        // Tem de bater com o cálculo emitido no prelúdio (A32AddressSpace::EmitPrelude).
++        u32 h = static_cast<u32>(descriptor) ^ static_cast<u32>(descriptor >> 32);
++        h ^= h >> 16;
++        return (h >> 2) & (fast_dispatch_size - 1);
++    }
++
++    CodePtr GetOrEmitAndCache(IR::LocationDescriptor descriptor) {
++        const CodePtr ptr = GetOrEmit(descriptor);
++        FastDispatchEntry& e = fast_dispatch_table[FastDispatchIndex(descriptor.Value())];
++        e.location_descriptor = descriptor.Value();
++        e.code_ptr = ptr;
++        return ptr;
++    }
++
++    CodePtr GetFast(IR::LocationDescriptor descriptor) {
++        const FastDispatchEntry& e = fast_dispatch_table[FastDispatchIndex(descriptor.Value())];
++        if (e.location_descriptor == descriptor.Value()) {
++            return e.code_ptr;
++        }
++        return GetOrEmitAndCache(descriptor);
++    }
++
++    void ClearFastDispatchTable();
++
+ protected:
+     virtual EmitConfig GetEmitConfig() = 0;
+     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
+@@ -83,6 +121,8 @@
+     ExceptionHandler exception_handler;
+     FastmemManager fastmem_manager;
+ 
++    std::unique_ptr<FastDispatchEntry[]> fast_dispatch_table;
++
+     struct PreludeInfo {
+         std::ptrdiff_t end_of_prelude;
+ 

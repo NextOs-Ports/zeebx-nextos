@@ -13,6 +13,10 @@ use dynarmic::a32::{ArchVersion, Callbacks, Dynarmic as Jit, VAddr};
 use dynarmic::{CallbackImpl, GuestInt, HaltReason};
 
 use super::mem::GuestMemory;
+
+#[path = "memoria_jit.rs"]
+mod memoria_jit;
+use memoria_jit::MemoriaJit;
 use super::{API_BASE, API_SIZE, RETURN_MAGIC};
 use super::{CpuBackend, CpuError, Reg, StopReason};
 
@@ -34,11 +38,6 @@ const LINHA: u32 = 64;
 
 /// Quantas páginas de 4 KB cabem nos 32 bits do guest: o tamanho da tabela de páginas.
 const PAGINAS: usize = 1 << 20;
-
-/// Bytes reservados além do fim de cada região gravável. Uma leitura de quatro bytes nos últimos
-/// bytes de uma página que termina a região cruza a borda na memória do host; com a folga, ela
-/// lê memória alocada em vez de sair do vetor.
-const FOLGA_DA_REGIAO: usize = 16;
 
 /// O que uma callback pediu que `run` devolva. O Dynarmic recebe os acessos de memória dentro
 /// do bloco recompilado; guardar o motivo aqui preserva a distinção entre API, retorno e falha.
@@ -128,6 +127,13 @@ pub mod conta {
     /// numa delas.
     pub static DOBRAS: AtomicU64 = AtomicU64::new(0);
     pub static LIMPEZAS: AtomicU64 = AtomicU64::new(0);
+    /// Os acessos lentos por motivo, `[leituras, escritas]` de cada classe: página de código
+    /// (executada), faixa vigiada, região só de leitura e o resto (página parcial, fora do mapa).
+    pub static LENTAS_POR_CLASSE: [[AtomicU64; 2]; 4] = [const { [const { AtomicU64::new(0) }; 2] }; 4];
+    /// Entradas no JIT (`run`): cada chamada de API sai e volta.
+    pub static ENTRADAS: AtomicU64 = AtomicU64::new(0);
+    /// Instruções do guest lidas para tradução (`memory_read_code`): quanto o JIT compilou.
+    pub static TRADUZIDAS: AtomicU64 = AtomicU64::new(0);
 }
 
 /// Estado compartilhado entre as callbacks C++ e o invólucro Rust.
@@ -136,7 +142,7 @@ pub mod conta {
 /// se move. Isso permite à callback interromper a execução no instante em que o PC entra numa
 /// vtable BREW, em vez de executar uma instrução falsa naquele endereço.
 struct Estado {
-    memoria: Rc<RefCell<GuestMemory>>,
+    memoria: Rc<RefCell<MemoriaJit>>,
     semihosting: Rc<RefCell<String>>,
     /// Só uma escrita em memória que já foi buscada como código pode invalidar um bloco JIT.
     /// Isto exclui os milhões de escritas nos buffers RGB565.
@@ -185,9 +191,12 @@ struct Estado {
 
 impl Estado {
     /// Tira a página da tabela: dali em diante leitura e escrita nela passam pelas callbacks.
+    /// Com fastmem, a página fica só de leitura na arena: a leitura continua rápida, e a escrita
+    /// falta, é recompilada pela tabela e chega à callback.
     fn anula_pagina(&self, pagina: u32) {
         if (pagina as usize) < PAGINAS {
             unsafe { *self.tabela.add(pagina as usize) = std::ptr::null_mut() };
+            self.memoria.borrow().protege(pagina, false);
         }
     }
 
@@ -268,6 +277,23 @@ impl Estado {
         self.envoltorio.set((menor, maior));
     }
 
+    /// Só para `ZEEBX_MEDE`: por que o acesso a `addr` caiu na callback.
+    fn conta_lenta(&self, addr: u32, escrita: bool) {
+        let classe = if self.paginas_executadas.contem(addr / PAGE) {
+            0
+        } else if self.vigias.borrow().iter().any(|v| addr >= v.1 && addr < v.2) {
+            1
+        } else if self.memoria.borrow().regioes().iter().any(|r| {
+            !r.writable && addr >= r.base && u64::from(addr) < u64::from(r.base) + r.len as u64
+        }) {
+            2
+        } else {
+            3
+        };
+        conta::LENTAS_POR_CLASSE[classe][usize::from(escrita)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn marca_codigo_sujo(&self, addr: u32, len: u32) {
         let fim = addr.saturating_add(len.saturating_sub(1));
         for pagina in (addr / PAGE)..=(fim / PAGE) {
@@ -326,6 +352,9 @@ impl Callbacks for Estado {
     }
 
     fn memory_read_code(cb: &CallbackImpl<Self>, addr: VAddr) -> Option<u32> {
+        if crate::video::gpu::mede::ligado() {
+            conta::TRADUZIDAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut bytes = [0; 4];
         if cb.memoria.borrow().executavel(addr) && cb.le(addr, &mut bytes) {
             // Página que vira código sai da tabela, para que toda escrita nela chegue à callback
@@ -346,6 +375,7 @@ impl Callbacks for Estado {
     extern "C" fn memory_read<T: GuestInt>(cb: &CallbackImpl<Self>, addr: VAddr) -> T {
         if crate::video::gpu::mede::ligado() {
             conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cb.conta_lenta(addr, false);
         }
         let mut bytes = [0u8; 8];
         let len = size_of::<T>();
@@ -360,6 +390,7 @@ impl Callbacks for Estado {
     extern "C" fn memory_write<T: GuestInt>(cb: &mut CallbackImpl<Self>, addr: VAddr, value: T) {
         if crate::video::gpu::mede::ligado() {
             conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cb.conta_lenta(addr, true);
         }
         let len = size_of::<T>();
         let bytes = unsafe { std::slice::from_raw_parts((&value as *const T).cast::<u8>(), len) };
@@ -437,7 +468,7 @@ impl Callbacks for Estado {
 /// Recompilador A32. Fica separado do backend padrão até a equivalência ser estabelecida jogo
 /// a jogo; criar a CPU não aloca o JIT, porque o mapa do guest só existe em `reset`.
 pub struct DynarmicCpu {
-    memoria: Rc<RefCell<GuestMemory>>,
+    memoria: Rc<RefCell<MemoriaJit>>,
     semihosting: Rc<RefCell<String>>,
     jit: Option<Box<Jit<Estado>>>,
     /// **A tabela de páginas: o acesso à memória sem callback.** Sem ela, cada leitura e escrita
@@ -476,7 +507,8 @@ impl DynarmicCpu {
             if vigiada || jit.paginas_executadas.contem(pagina) {
                 continue;
             }
-            self.tabela[pagina as usize] = ponteiro_da_pagina(&memoria, pagina);
+            self.tabela[pagina as usize] = memoria.ponteiro_da_pagina(pagina);
+            memoria.protege(pagina, true);
         }
     }
 
@@ -547,25 +579,15 @@ impl CpuBackend for DynarmicCpu {
         // `GuestMemory` é deliberadamente construído uma vez antes da execução. Copiar o mapa
         // para a memória que as callbacks possuem mantém o contrato do backend: a API Rust e o
         // ARM enxergam os mesmos bytes a partir daqui.
-        let mut copia = GuestMemory::new();
-        for regiao in mem.regions() {
-            copia
-                .map_com_execucao(
-                    regiao.name,
-                    regiao.base,
-                    regiao.bytes.clone(),
-                    regiao.writable,
-                    regiao.executavel,
-                )
-                .map_err(|e| CpuError(e.to_string()))?;
-        }
-        for regiao in copia.regions_mut() {
-            regiao.bytes.reserve_exact(FOLGA_DA_REGIAO);
-        }
+        //
+        // O JIT antigo é desfeito antes: ele guarda o endereço da arena da memória antiga.
+        self.jit = None;
+        let copia = MemoriaJit::nova(mem);
         self.tabela.fill(std::ptr::null_mut());
         for pagina in 0..PAGINAS as u32 {
-            self.tabela[pagina as usize] = ponteiro_da_pagina(&copia, pagina);
+            self.tabela[pagina as usize] = copia.ponteiro_da_pagina(pagina);
         }
+        let arena = copia.arena();
         self.memoria = Rc::new(RefCell::new(copia));
         self.semihosting.borrow_mut().clear();
         let estado = Estado {
@@ -593,6 +615,11 @@ impl CpuBackend for DynarmicCpu {
         // Entrada = início da página no host, sem deslocamento absoluto nem bits de atributo.
         config.page_table_mask(0);
         unsafe { config.page_table(self.tabela.as_mut_ptr().cast()) };
+        // Com a arena, o acesso é uma instrução só; a tabela fica para as instruções que já
+        // faltaram uma vez (escrita em página protegida), que o Dynarmic recompila por ela.
+        if let Some(arena) = arena {
+            unsafe { config.fastmem(arena.cast(), true) };
+        }
         let mut jit = Box::new(config.init(estado));
         let ptr = &mut *jit as *mut Jit<Estado>;
         jit.jit.set(ptr);
@@ -762,6 +789,9 @@ impl CpuBackend for DynarmicCpu {
         jit.parada.set(Parada::Nenhuma);
         jit.limite
             .set(jit.instrucoes.get().saturating_add(max_instructions));
+        if crate::video::gpu::mede::ligado() {
+            conta::ENTRADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = unsafe { jit.run() };
         // Não há invalidação para páginas de dados: só código previamente executado chega aqui.
         // É seguro mexer no cache depois de o JIT devolver o controle, nunca da callback.
@@ -795,24 +825,6 @@ impl CpuBackend for DynarmicCpu {
             Parada::Excecao(pc) => Ok(StopReason::Exception { pc }),
         }
     }
-}
-
-/// O início da `pagina` na memória do host, quando ela é gravável e cabe inteira numa região.
-fn ponteiro_da_pagina(memoria: &GuestMemory, pagina: u32) -> *mut u8 {
-    let inicio = u64::from(pagina) * u64::from(PAGE);
-    let fim = inicio + u64::from(PAGE);
-    memoria
-        .regions()
-        .iter()
-        .find(|r| {
-            r.writable
-                && inicio >= u64::from(r.base)
-                && fim <= u64::from(r.base) + r.bytes.len() as u64
-        })
-        .map_or(std::ptr::null_mut(), |r| {
-            // A região não é realocada depois do `reset`: o vetor só é escrito, nunca cresce.
-            unsafe { r.bytes.as_ptr().add((inicio - u64::from(r.base)) as usize) as *mut u8 }
-        })
 }
 
 #[cfg(test)]
@@ -1000,6 +1012,29 @@ mod tests {
         assert_eq!(chama("fflt", (-7i32) as u32, 0), f(-7.0));
         assert_eq!(chama("ffix", f(-7.9), 0), (-7i32) as u32, "trunca para zero");
         assert_eq!(chama("ffix", f(3.0e10), 0), i32::MAX as u32, "satura");
+    }
+
+    /// `bx r1` com registrador que não é o `lr` é despacho indireto: no backend arm64 ele passa
+    /// pela tabela de despacho rápido (`nextos/dynarmic/`), que guarda o endereço do bloco
+    /// compilado. Código reescrito tem de esvaziá-la, senão o salto cai no bloco velho.
+    #[test]
+    fn salto_indireto_segue_o_codigo_reescrito() {
+        let mut code = [0xe3a0_1040u32, 0xe12f_ff11]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        code.resize(0x40, 0);
+        code.extend_from_slice(&[0xe3a0_0001u32.to_le_bytes(), 0xe12f_ff1eu32.to_le_bytes()].concat());
+        let mut cpu = cpu_with(&code);
+        for _ in 0..3 {
+            cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+            assert_eq!(cpu.run(0, 10).unwrap(), StopReason::Returned);
+            assert_eq!(cpu.read_reg(Reg::R0), 1);
+        }
+        cpu.write_mem(0x40, &0xe3a0_0002u32.to_le_bytes()).unwrap();
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+        assert_eq!(cpu.run(0, 10).unwrap(), StopReason::Returned);
+        assert_eq!(cpu.read_reg(Reg::R0), 2, "o salto indireto foi para o bloco velho");
     }
 
     #[test]

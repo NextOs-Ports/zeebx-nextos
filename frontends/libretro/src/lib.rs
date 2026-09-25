@@ -2360,6 +2360,16 @@ fn relata_medicao(duracao: std::time::Duration) {
         zeebx::cpu::dynarmic::conta::LIMPEZAS.swap(0, Relaxed),
     ));
     {
+        use zeebx::cpu::dynarmic::conta as c;
+        let l = |i: usize, e: usize| c::LENTAS_POR_CLASSE[i][e].swap(0, Relaxed) as f64 / q;
+        log(&format!(
+            "Zeebx MEDE jit: {:.0} entradas/q | {:.0} instruções traduzidas/q | lentas l/e: código {:.0}/{:.0}, vigiadas {:.0}/{:.0}, só leitura {:.0}/{:.0}, outras {:.0}/{:.0}",
+            c::ENTRADAS.swap(0, Relaxed) as f64 / q,
+            c::TRADUZIDAS.swap(0, Relaxed) as f64 / q,
+            l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1), l(3, 0), l(3, 1),
+        ));
+    }
+    {
         use zeebx::machine::bitmap_conta as b;
         log(&format!(
             "Zeebx MEDE 2d: {:.0} sincronizações/q | {} superfícies | {:.1} leituras/q | {:.1} escritas inteiras/q | {:.0} KB/q",

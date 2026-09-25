@@ -50,8 +50,34 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 CM
 export CMAKE_TOOLCHAIN_FILE_$TU="$TCFILE"
 
-cargo build --release --locked --target $T -p zeebx-libretro "$@"
+# **O diretório compartilhado não separa worktrees.** O hash do crate não inclui o caminho do
+# worktree e o dep-info guarda caminhos relativos: se outro agente compilou depois da última
+# edição daqui, o cargo acha o rlib fresco e liga o código DELE neste core. Tocar as fontes
+# deste worktree (dentro da trava) força a recompilação com elas. Aviso da frente api, 25/09.
+find src frontends/libretro/src frontends/libretro/build.rs build.rs -type f -exec touch {} + 2>/dev/null || true
+MARCA=$(mktemp); trap 'rm -f "$MARCA"' EXIT
+
+# O dynarmic com os remendos de nextos/dynarmic/ (ver prepara.sh). ZEEBX_DYNARMIC_ORIGINAL=1 usa o
+# crate como veio, para comparar.
+LIGA_DYN=()
+if [ -z "${ZEEBX_DYNARMIC_ORIGINAL:-}" ]; then
+  DYN=$(./nextos/dynarmic/prepara.sh)
+  LIGA_DYN=(--config "target.$T.dynarmic.rustc-link-search=[\"native=$DYN\"]"
+            --config "target.$T.dynarmic.rustc-link-lib=[\"static=wrapper\",\"static=dynarmic\",\"static=fmt\",\"static=mcl\",\"stdc++\"]")
+  echo "dynarmic remendado: $DYN"
+fi
+
+# ZEEBX_TESTA_AARCH64=1: em vez do core, roda os testes da biblioteca compilados para aarch64
+# sob o qemu-aarch64 (o backend arm64 do dynarmic, o remendado, só existe lá; no PC os testes
+# usam o backend x64). Argumentos extras viram filtro dos testes.
+if [ -n "${ZEEBX_TESTA_AARCH64:-}" ]; then
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L $SR -E LD_LIBRARY_PATH=/usr/lib:/lib:$TC/$TRIPLO/lib64"
+  exec cargo test --release --locked --target $T -p zeebx --lib --no-default-features --features gl,soundfont "${LIGA_DYN[@]}" -- "$@"
+fi
+
+cargo build --release --locked --target $T -p zeebx-libretro "${LIGA_DYN[@]}" "$@"
 SO=$CARGO_TARGET_DIR/$T/release/libzeebx_libretro.so
+[ "$SO" -nt "$MARCA" ] || { echo "ERRO: o .so não foi refeito por este build; nada copiado" >&2; exit 1; }
 file "$SO" | cut -d, -f1-3
 "$TC/bin/$TRIPLO-readelf" -d "$SO" | grep -E "NEEDED|RPATH|RUNPATH" || true
 "$TC/bin/$TRIPLO-readelf" -V "$SO" | grep -oE 'GLIBC_[0-9.]+|GLIBCXX_[0-9.]+' | sort -Vu | tail -2
