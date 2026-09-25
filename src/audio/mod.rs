@@ -12,6 +12,25 @@ pub mod midi;
 pub mod mp3;
 pub mod wav;
 
+/// Contadores do mixer para a medição de áudio do core (`ZEEBX_AUDIO_MEDE`). Só somam; quem lê
+/// zera. Existem para responder, sem ouvir, se um fluxo PCM recebe amostras, se elas têm som e
+/// quantos quadros da saída ficaram sem amostra do fluxo.
+pub mod conta {
+    use std::sync::atomic::AtomicU64;
+    /// Quadros de fluxo PCM que o jogo entregou.
+    pub static FLUXO_RECEBIDOS: AtomicU64 = AtomicU64::new(0);
+    /// Quadros de fluxo recebidos que tinham alguma amostra diferente de zero.
+    pub static FLUXO_COM_SOM: AtomicU64 = AtomicU64::new(0);
+    /// Quadros da saída em que um fluxo tocando não tinha amostra (falta).
+    pub static FLUXO_FALTAS: AtomicU64 = AtomicU64::new(0);
+    /// Quadros descartados porque o fluxo passou da capacidade.
+    pub static FLUXO_DESCARTES: AtomicU64 = AtomicU64::new(0);
+    /// Vozes (sons inteiros) que começaram a tocar.
+    pub static VOZES_INICIADAS: AtomicU64 = AtomicU64::new(0);
+    /// Vozes cortadas por `stop` ou por um `play` novo no mesmo objeto enquanto soavam.
+    pub static VOZES_CORTADAS: AtomicU64 = AtomicU64::new(0);
+}
+
 /// Backend de síntese MIDI desejado pelo usuário ou frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MidiBackend {
@@ -215,6 +234,7 @@ impl Stream {
             self.fraction -= 1.0;
             self.previous = self.current;
             if self.samples.len() < self.channels {
+                conta::FLUXO_FALTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Faltou amostra: não segure o último valor indefinidamente. Isso vira uma
                 // componente DC audível (principalmente nos ports que alimentam PCM em blocos).
                 // Cai suavemente para zero em poucos milissegundos e não acumula atraso.
@@ -288,6 +308,10 @@ impl Mixer {
             return;
         };
         let step = f64::from(sound.rate) / f64::from(state.rate.max(1));
+        conta::VOZES_INICIADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if state.voices.get(&id).is_some_and(|v| !v.done && !v.paused) {
+            conta::VOZES_CORTADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         state.voices.insert(
             id,
             Voice {
@@ -349,10 +373,21 @@ impl Mixer {
         let excess = stream.samples.len().saturating_sub(stream.capacity);
         let excess = excess - excess % stream.channels;
         stream.samples.drain(..excess);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let ch = stream.channels.max(1);
+            conta::FLUXO_RECEBIDOS.fetch_add((samples.len() / ch) as u64, Relaxed);
+            let com_som = samples.chunks(ch).filter(|q| q.iter().any(|&a| a != 0.0)).count();
+            conta::FLUXO_COM_SOM.fetch_add(com_som as u64, Relaxed);
+            conta::FLUXO_DESCARTES.fetch_add((excess / ch) as u64, Relaxed);
+        }
     }
 
     pub fn stop(&self, id: u32) {
         if let Ok(mut state) = self.state.lock() {
+            if state.voices.get(&id).is_some_and(|v| !v.done && !v.paused) {
+                conta::VOZES_CORTADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             state.voices.remove(&id);
             state.streams.remove(&id);
         }
