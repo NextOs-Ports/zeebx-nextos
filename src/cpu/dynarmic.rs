@@ -128,6 +128,10 @@ pub mod conta {
     /// numa delas.
     pub static DOBRAS: AtomicU64 = AtomicU64::new(0);
     pub static LIMPEZAS: AtomicU64 = AtomicU64::new(0);
+    /// Instruções do guest executadas no JIT (a contagem de ciclos do Dynarmic). Com a parte do
+    /// JIT no perfil do aparelho, dá o custo por instrução — e diz se vale tirar instrução do
+    /// jogo (trocar rotina de biblioteca) ou baratear cada uma.
+    pub static INSTRUCOES: AtomicU64 = AtomicU64::new(0);
 }
 
 /// Estado compartilhado entre as callbacks C++ e o invólucro Rust.
@@ -762,7 +766,12 @@ impl CpuBackend for DynarmicCpu {
         jit.parada.set(Parada::Nenhuma);
         jit.limite
             .set(jit.instrucoes.get().saturating_add(max_instructions));
+        let antes = jit.instrucoes.get();
         let _ = unsafe { jit.run() };
+        if crate::video::gpu::mede::ligado() {
+            let feitas = jit.instrucoes.get().saturating_sub(antes);
+            conta::INSTRUCOES.fetch_add(feitas, std::sync::atomic::Ordering::Relaxed);
+        }
         // Não há invalidação para páginas de dados: só código previamente executado chega aqui.
         // É seguro mexer no cache depois de o JIT devolver o controle, nunca da callback.
         if jit.limpa_tudo.replace(false) {
@@ -971,7 +980,7 @@ mod tests {
             }
         }
         let (trampolins, trocas) = vfp::acelera(&mut modulo, 0);
-        assert_eq!(trocas.len(), 6, "{trocas:?}");
+        assert_eq!(trocas.len(), 11, "{trocas:?}");
         let chama = |nome: &str, r0: u32, r1: u32| -> u32 {
             let entrada = trocas.iter().find(|t| t.nome == nome).unwrap().entrada;
             let mut m = modulo.clone();
@@ -981,7 +990,7 @@ mod tests {
             m[0x44..0x48].copy_from_slice(&0xe12f_ff14u32.to_le_bytes()); // bx r4
             let mut mem = GuestMemory::new();
             mem.map("code", 0, m, true).unwrap();
-            mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.clone(), false, true).unwrap();
+            mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.novos.clone(), false, true).unwrap();
             mem.map_zeroed("stack", 0x2000_0000, 0x1000).unwrap();
             let mut cpu = DynarmicCpu::new().unwrap();
             cpu.reset(&mem).unwrap();
@@ -1000,6 +1009,165 @@ mod tests {
         assert_eq!(chama("fflt", (-7i32) as u32, 0), f(-7.0));
         assert_eq!(chama("ffix", f(-7.9), 0), (-7i32) as u32, "trunca para zero");
         assert_eq!(chama("ffix", f(3.0e10), 0), i32::MAX as u32, "satura");
+        assert_eq!(chama("ffixu", f(3.0e9), 0), 3_000_000_000, "acima de i32::MAX");
+        assert_eq!(chama("ffixu", f(-5.0), 0), 0, "negativo dá zero");
+        assert_eq!(chama("ffixu", f(7.9), 0), 7, "trunca");
+        assert_eq!(chama("frsb", f(1.5), f(2.25)), f(0.75), "r1 - r0");
+        assert_eq!(chama("fsqrt", f(2.25), 0), f(1.5));
+        assert_eq!(chama("fsqrt", f(-4.0), 0), 0x7fc0_0000, "NaN padrão");
+        // As comparações devolvem flags; `chama` lê r0, então cada caso passa pelas flags com
+        // um trecho `movlo r0,#1 ; moveq r0,#2 ; movhi r0,#3` (ver `compara`).
+        let compara = |nome: &str, a: f32, b: f32| -> u32 {
+            let entrada = trocas.iter().find(|t| t.nome == nome).unwrap().entrada;
+            let mut m = modulo.clone();
+            let bl = 0xeb00_0000 | ((entrada.wrapping_sub(0x40 + 8) >> 2) & 0x00ff_ffff);
+            let codigo = [
+                bl,
+                0xe3a0_0000, // mov r0, #0 (não mexe nas flags)
+                0x33a0_0001, // movlo r0, #1
+                0x03a0_0002, // moveq r0, #2
+                0x83a0_0003, // movhi r0, #3
+                0xe12f_ff14, // bx r4
+            ];
+            for (k, w) in codigo.iter().enumerate() {
+                m[0x40 + 4 * k..0x44 + 4 * k].copy_from_slice(&w.to_le_bytes());
+            }
+            let mut mem = GuestMemory::new();
+            mem.map("code", 0, m, true).unwrap();
+            mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.novos.clone(), false, true).unwrap();
+            mem.map_zeroed("stack", 0x2000_0000, 0x1000).unwrap();
+            let mut cpu = DynarmicCpu::new().unwrap();
+            cpu.reset(&mem).unwrap();
+            cpu.write_reg(Reg::Sp, 0x2000_0f00);
+            cpu.write_reg(Reg::R0, f(a));
+            cpu.write_reg(Reg::R1, f(b));
+            cpu.write_reg(Reg::R4, RETURN_MAGIC);
+            assert_eq!(cpu.run(0x40, 100).unwrap(), StopReason::Returned, "{nome}");
+            cpu.read_reg(Reg::R0)
+        };
+        assert_eq!(compara("fcmp", -1.0, 1.0), 1, "menor");
+        assert_eq!(compara("fcmp", 2.0, 2.0), 2, "igual");
+        assert_eq!(compara("fcmp", 0.0, -0.0), 2, "+0 == -0");
+        assert_eq!(compara("fcmp", -1.0, -3.0), 3, "maior");
+        assert_eq!(compara("fcmp", f32::NAN, 1.0), 3, "NaN: C=1 Z=0");
+        assert_eq!(compara("fcmpr", -1.0, 1.0), 3, "invertida: cmp(1, -1)");
+        assert_eq!(compara("fcmpr", 5.0, 7.0), 3);
+        assert_eq!(compara("fcmpr", 7.0, 5.0), 1);
+    }
+
+    /// Diferencial contra a biblioteca de verdade: cada rotina trocada de um `.mod` de jogo
+    /// (`ZEEBX_MOD_TESTE=caminho/jogo.mod`, fora do repositório) roda com o código original e
+    /// com o trampolim, para as mesmas entradas, e os resultados têm de bater bit a bit (as
+    /// comparações, em C e Z). Ficam de fora NaN e subnormais, onde a diferença é conhecida
+    /// (a biblioteca chama o tratador de exceção / trata subnormal como zero).
+    /// `cargo test ... diferencial -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn diferencial_contra_a_biblioteca_do_jogo() {
+        use crate::loader::vfp;
+        let Some(caminho) = std::env::var_os("ZEEBX_MOD_TESTE") else { return };
+        let original = std::fs::read(caminho).unwrap();
+        const BASE: u32 = 0x1_0000;
+        let mut trocado = original.clone();
+        let (trampolins, trocas) = vfp::acelera(&mut trocado, BASE);
+        let roda = |modulo: &[u8], entrada: u32, r0: u32, r1: u32| -> (u32, u32) {
+            // 0x1000: bl entrada ; mrs r5, cpsr ; bx r4
+            let bl = 0xeb00_0000 | ((entrada.wrapping_sub(0x1000 + 8) >> 2) & 0x00ff_ffff);
+            let stub: Vec<u8> = [bl, 0xe10f_5000, 0xe12f_ff14].iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+            let mut mem = GuestMemory::new();
+            mem.map("stub", 0x1000, stub, false).unwrap();
+            let mut bytes = modulo.to_vec();
+            bytes.resize(bytes.len() + 0x10_0000, 0); // .bss
+            mem.map("module", BASE, bytes, true).unwrap();
+            mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.novos.clone(), false, true).unwrap();
+            mem.map_zeroed("stack", 0x2000_0000, 0x1000).unwrap();
+            let mut cpu = DynarmicCpu::new().unwrap();
+            cpu.reset(&mem).unwrap();
+            cpu.write_reg(Reg::Sp, 0x2000_0f00);
+            cpu.write_reg(Reg::R0, r0);
+            cpu.write_reg(Reg::R1, r1);
+            cpu.write_reg(Reg::R4, RETURN_MAGIC);
+            assert_eq!(cpu.run(0x1000, 100_000).unwrap(), StopReason::Returned);
+            (cpu.read_reg(Reg::R0), cpu.read_reg(Reg::R5) >> 28)
+        };
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut aleatorio = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u32
+        };
+        // Float "comum": expoente entre 2^-40 e 2^40, sinal qualquer; às vezes zero ou inteiro.
+        let valor = |aleatorio: &mut dyn FnMut() -> u32| -> u32 {
+            let r = aleatorio();
+            match r % 16 {
+                0 => (r & 0x8000_0000),
+                1 => (((r >> 8) % 2000) as f32).to_bits() | (r & 0x8000_0000), // inteiro pequeno
+                _ => (r & 0x807f_ffff) | ((((r >> 23) & 0x7f) % 80 + 87) << 23),
+            }
+        };
+        for t in &trocas {
+            let mut diferencas = 0;
+            for _ in 0..3000 {
+                let (mut a, mut b) = (valor(&mut aleatorio), valor(&mut aleatorio));
+                match t.nome {
+                    "fflt" => a = aleatorio() >> (aleatorio() % 32),
+                    "ffltu" => a = aleatorio() >> (aleatorio() % 32),
+                    "fsqrt" => a &= 0x7fff_ffff,
+                    "fcmp" | "fcmpr" if aleatorio() % 4 == 0 => b = a,
+                    _ => {}
+                }
+                if t.nome == "fflt" && aleatorio() % 2 == 0 {
+                    a = a.wrapping_neg();
+                }
+                let (r_orig, f_orig) = roda(&original, t.entrada, a, b);
+                let (r_novo, f_novo) = roda(&trocado, t.entrada, a, b);
+                let bate = match t.nome {
+                    "fcmp" | "fcmpr" => f_orig & 0b0110 == f_novo & 0b0110,
+                    _ => r_orig == r_novo,
+                };
+                if !bate {
+                    diferencas += 1;
+                    if diferencas <= 3 {
+                        eprintln!("{} a={a:#x} b={b:#x}: biblioteca {r_orig:#x}/{f_orig:04b}, VFP {r_novo:#x}/{f_novo:04b}", t.nome);
+                    }
+                }
+            }
+            eprintln!("{} @{:#x}: {} diferenças em 3000", t.nome, t.entrada, diferencas);
+            assert_eq!(diferencas, 0, "{}", t.nome);
+        }
+    }
+
+    /// A chamada reescrita pelo `loader::vfp` vai a um trampolim só dela e volta com `b` fixo
+    /// para a instrução seguinte ao `bl`, com a conta feita.
+    #[test]
+    fn chamada_reescrita_para_trampolim_proprio_volta_ao_chamador() {
+        use crate::loader::vfp;
+        let fmul = vfp::assinaturas_para_teste()[2].clone();
+        let mut modulo = vec![0u8; 0x1000];
+        for (k, w) in fmul.iter().enumerate() {
+            modulo[0x200 + 4 * k..0x204 + 4 * k].copy_from_slice(&w.to_le_bytes());
+        }
+        // 0x40: bl 0x200 ; 0x44: add r0, r0, #0 (sinal de que voltou aqui) ; 0x48: bx r4
+        let bl = 0xeb00_0000u32 | ((0x200 - 0x40 - 8) >> 2);
+        modulo[0x40..0x44].copy_from_slice(&bl.to_le_bytes());
+        modulo[0x44..0x48].copy_from_slice(&0xe280_0000u32.to_le_bytes());
+        modulo[0x48..0x4c].copy_from_slice(&0xe12f_ff14u32.to_le_bytes());
+        let (trampolins, trocas) = vfp::acelera(&mut modulo, 0);
+        assert_eq!(trocas[0].chamadas, 1);
+        assert_eq!(modulo[0x43], 0xea, "o bl virou b");
+        let mut mem = GuestMemory::new();
+        mem.map("code", 0, modulo, true).unwrap();
+        mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.novos, false, true).unwrap();
+        mem.map_zeroed("stack", 0x2000_0000, 0x1000).unwrap();
+        let mut cpu = DynarmicCpu::new().unwrap();
+        cpu.reset(&mem).unwrap();
+        cpu.write_reg(Reg::Sp, 0x2000_0f00);
+        cpu.write_reg(Reg::R0, 3.0f32.to_bits());
+        cpu.write_reg(Reg::R1, 0.5f32.to_bits());
+        cpu.write_reg(Reg::R4, RETURN_MAGIC);
+        assert_eq!(cpu.run(0x40, 100).unwrap(), StopReason::Returned);
+        assert_eq!(cpu.read_reg(Reg::R0), 1.5f32.to_bits());
     }
 
     #[test]

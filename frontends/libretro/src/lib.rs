@@ -2353,7 +2353,8 @@ fn relata_medicao(duracao: std::time::Duration) {
         NS_VIDEO.swap(0, Relaxed) as f64 / 1e6 / q
     ));
     log(&format!(
-        "Zeebx MEDE cpu: {:.1} linhas de código invalidadas/q | {:.0} acessos lentos/q | {} dobras | {} limpezas de cache",
+        "Zeebx MEDE cpu: {:.0} mil instruções do jogo/q | {:.1} linhas de código invalidadas/q | {:.0} acessos lentos/q | {} dobras | {} limpezas de cache",
+        zeebx::cpu::dynarmic::conta::INSTRUCOES.swap(0, Relaxed) as f64 / q / 1e3,
         zeebx::cpu::dynarmic::conta::INVALIDACOES.swap(0, Relaxed) as f64 / q,
         zeebx::cpu::dynarmic::conta::LENTAS.swap(0, Relaxed) as f64 / q,
         zeebx::cpu::dynarmic::conta::DOBRAS.swap(0, Relaxed),
