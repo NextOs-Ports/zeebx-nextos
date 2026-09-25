@@ -128,6 +128,10 @@ pub mod conta {
     /// numa delas.
     pub static DOBRAS: AtomicU64 = AtomicU64::new(0);
     pub static LIMPEZAS: AtomicU64 = AtomicU64::new(0);
+    /// Instruções do guest executadas no JIT (a contagem de ciclos do Dynarmic). Com a parte do
+    /// JIT no perfil do aparelho, dá o custo por instrução — e diz se vale tirar instrução do
+    /// jogo (trocar rotina de biblioteca) ou baratear cada uma.
+    pub static INSTRUCOES: AtomicU64 = AtomicU64::new(0);
 }
 
 /// Estado compartilhado entre as callbacks C++ e o invólucro Rust.
@@ -762,7 +766,12 @@ impl CpuBackend for DynarmicCpu {
         jit.parada.set(Parada::Nenhuma);
         jit.limite
             .set(jit.instrucoes.get().saturating_add(max_instructions));
+        let antes = jit.instrucoes.get();
         let _ = unsafe { jit.run() };
+        if crate::video::gpu::mede::ligado() {
+            let feitas = jit.instrucoes.get().saturating_sub(antes);
+            conta::INSTRUCOES.fetch_add(feitas, std::sync::atomic::Ordering::Relaxed);
+        }
         // Não há invalidação para páginas de dados: só código previamente executado chega aqui.
         // É seguro mexer no cache depois de o JIT devolver o controle, nunca da callback.
         if jit.limpa_tudo.replace(false) {
