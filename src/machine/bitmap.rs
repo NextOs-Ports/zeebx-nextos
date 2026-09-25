@@ -1192,19 +1192,53 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     pub(super) fn sync_surfaces_out(&mut self) -> Result<(), CpuError> {
-        // Mesma ideia do lado de lá: sem superfície escrita ou criada e sem mudança nos mapas de
-        // DIB desde a última passada completa, todas continuam publicadas.
-        let carimbo = (crate::video::display::carimbo_das_superficies(), self.dib_mudancas);
-        if self.dib_saida_limpa == Some(carimbo) {
-            return Ok(());
+        use crate::video::display::{cursor_das_sujas, sujas_desde, superficies_criadas};
+        // Mesma ideia do lado de lá: sem superfície criada e sem mudança nos mapas de DIB desde
+        // a última passada completa, toda superfície exposta ficou publicada, limpa e sem
+        // herança naquela passada. Dali em diante só pode ter ficado para trás a que ganhou caixa
+        // suja — e essas o anel de sujas lista, uma vez cada. Visitar só elas, em vez das 49
+        // superfícies do Pac-Mania a cada uma das 2.828 chamadas que desenham por quadro, é o
+        // que tirou a passada dos 15% do processador.
+        if let Some((criadas, mudancas, cursor)) = self.dib_saida_limpa
+            && criadas == superficies_criadas()
+            && mudancas == self.dib_mudancas
+        {
+            let mut sujas = std::mem::take(&mut self.dib_sujas);
+            sujas.clear();
+            let novo = sujas_desde(cursor, |serie| {
+                if let Some(&bitmap) = self.dib_por_serie.get(&serie) {
+                    sujas.push(bitmap);
+                }
+            });
+            if let Some(novo) = novo {
+                let mut resultado = Ok(());
+                for &bitmap in &sujas {
+                    resultado = self.sync_to_guest(bitmap);
+                    if resultado.is_err() {
+                        break;
+                    }
+                }
+                self.dib_sujas = sujas;
+                resultado?;
+                if let Some((_, _, cursor)) = self.dib_saida_limpa.as_mut() {
+                    *cursor = novo;
+                }
+                return Ok(());
+            }
+            self.dib_sujas = sujas;
         }
+        self.dib_saida_limpa = None;
+        // O cursor é lido **antes** da passada: o que ficar sujo durante ela entra depois dele e
+        // é visitado de novo na próxima, o que só custa uma consulta.
+        let cursor = cursor_das_sujas();
+        self.dib_por_serie.clear();
         for bitmap in self.dib_buffers.keys().copied().collect::<Vec<_>>() {
             self.sync_to_guest(bitmap)?;
+            if let Some(fb) = self.bitmaps.get(&bitmap) {
+                self.dib_por_serie.insert(fb.serie(), bitmap);
+            }
         }
-        self.dib_saida_limpa = Some((
-            crate::video::display::carimbo_das_superficies(),
-            self.dib_mudancas,
-        ));
+        self.dib_saida_limpa = Some((superficies_criadas(), self.dib_mudancas, cursor));
         Ok(())
     }
 

@@ -2621,8 +2621,13 @@ pub struct Machine<C: CpuBackend> {
     /// Carimbo da última passada completa de entrada que terminou com tudo limpo: (geração das
     /// vigias, `dib_mudancas`). Igual de novo, a passada não teria o que fazer.
     dib_entrada_limpa: Option<(u64, u64)>,
-    /// Carimbo da última passada completa de saída: (carimbo das superfícies, `dib_mudancas`).
-    dib_saida_limpa: Option<((u64, u64), u64)>,
+    /// Carimbo da última passada completa de saída: (superfícies criadas, `dib_mudancas`,
+    /// cursor no anel de sujas). Ver `sync_surfaces_out`.
+    dib_saida_limpa: Option<(u64, u64, u64)>,
+    /// A superfície exposta de cada [`Framebuffer::serie`], montado na passada completa de saída.
+    dib_por_serie: rustc_hash::FxHashMap<u64, u32>,
+    /// Rascunho da passada curta de saída, guardado para não alocar a cada chamada.
+    dib_sujas: Vec<u32>,
     /// A região de superfícies, com o mesmo alocador do heap do jogo. Ver
     /// [`Machine::reserva_superficie`].
     superficies: Heap,
@@ -3095,6 +3100,8 @@ impl<C: CpuBackend> Machine<C> {
             dib_iguais: Default::default(),
             dib_entrada_limpa: None,
             dib_saida_limpa: None,
+            dib_por_serie: Default::default(),
+            dib_sujas: Vec::new(),
             superficies: Heap::new(loader::SURFACE_BASE, loader::SURFACE_SIZE),
             widgets_avisando: std::collections::HashSet::new(),
             transparency: HashMap::new(),

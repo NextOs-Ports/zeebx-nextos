@@ -85,16 +85,64 @@ pub struct Framebuffer {
 /// De onde sai a [`Framebuffer::versao`] de cada superfície nova.
 static PROXIMA_SERIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Quantas vezes alguma superfície ganhou caixa suja, somando todas.
-static SUJAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Quantas superfícies já foram criadas: com o mesmo valor de antes, nenhuma nasceu desde então.
+pub fn superficies_criadas() -> u64 {
+    PROXIMA_SERIE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-/// Muda sempre que alguma superfície foi escrita ou criada: com o mesmo valor de antes, nenhuma
-/// caixa suja nova nem superfície nova existe desde então.
-pub fn carimbo_das_superficies() -> (u64, u64) {
-    (
-        SUJAS.load(std::sync::atomic::Ordering::Relaxed),
-        PROXIMA_SERIE.load(std::sync::atomic::Ordering::Relaxed),
-    )
+/// Quantas entradas cabem no [`ANEL_DE_SUJAS`].
+const ANEL: usize = 1024;
+
+/// As [`Framebuffer::serie`] das superfícies que passaram de limpas a sujas, em ordem.
+///
+/// **É o que deixa a sincronização de saída visitar só quem mudou.** O Pac-Mania tem 49
+/// superfícies expostas ao jogo e faz 2.828 chamadas que desenham por quadro; a passada que
+/// conferia as 49 a cada chamada, com cinco consultas a mapas por superfície, era 15% do
+/// processador do aparelho (medido no .30 com pilha). Uma superfície só entra aqui na
+/// **transição** de limpa para suja: sprite atrás de sprite na mesma tela é uma entrada só.
+///
+/// É global, e não por máquina, porque o `Framebuffer` não sabe de quem é. Quem lê guarda o
+/// próprio cursor e confere, depois de ler, se o anel não deu a volta por cima do que faltava
+/// — aí faz a passada completa. Série de outra máquina lida por engano é inofensiva: a
+/// máquina procura a série no mapa dela e não acha.
+static ANEL_DE_SUJAS: [std::sync::atomic::AtomicU64; ANEL] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ANEL];
+/// Quantas transições já foram escritas no anel, desde o começo.
+static ANEL_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn avisa_sujeira(serie: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let i = ANEL_TOTAL.fetch_add(1, Relaxed);
+    ANEL_DE_SUJAS[(i % ANEL as u64) as usize].store(serie, Relaxed);
+}
+
+/// Onde o anel está agora: o cursor de quem acabou de fazer uma passada completa.
+pub fn cursor_das_sujas() -> u64 {
+    ANEL_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Entrega a `visita` as séries que ficaram sujas desde `cursor` e devolve o cursor novo.
+///
+/// `None` quando o anel deu a volta e perdeu alguma: aí só a passada completa é segura.
+pub fn sujas_desde(cursor: u64, mut visita: impl FnMut(u64)) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let total = ANEL_TOTAL.load(Relaxed);
+    if total.wrapping_sub(cursor) > ANEL as u64 / 2 {
+        return None;
+    }
+    let mut series = [0u64; ANEL / 2];
+    let n = (total - cursor) as usize;
+    for (k, serie) in series[..n].iter_mut().enumerate() {
+        *serie = ANEL_DE_SUJAS[((cursor + k as u64) % ANEL as u64) as usize].load(Relaxed);
+    }
+    // Outra thread (outra máquina, nos testes) pode ter escrito por cima enquanto líamos.
+    if ANEL_TOTAL.load(Relaxed).wrapping_sub(cursor) > ANEL as u64 / 2 {
+        return None;
+    }
+    for serie in &series[..n] {
+        visita(*serie);
+    }
+    Some(total)
 }
 
 impl Framebuffer {
@@ -153,7 +201,9 @@ impl Framebuffer {
         self.touched = touched;
         self.serie = serie;
         self.sujo = sujo;
-        SUJAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if sujo.is_some() {
+            avisa_sujeira(serie);
+        }
     }
 
     /// Os pixels de `inicio` até `fim` como bytes RGB565 little-endian, **sem copiar** quando o
@@ -179,15 +229,55 @@ impl Framebuffer {
     }
 
     /// Estende a caixa suja para cobrir `[x0, x1) × [y0, y1)`.
+    ///
+    /// Só a passagem de limpa para suja vai para o [`ANEL_DE_SUJAS`]. O contador atômico que
+    /// havia aqui subia **a cada pixel**: 3,5% do processador no Pac-Mania, só nessa soma.
+    #[inline]
     fn suja(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        SUJAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.sujo = Some(match self.sujo {
-            None => [x0, y0, x1, y1],
-            Some([a, b, c, d]) => [a.min(x0), b.min(y0), c.max(x1), d.max(y1)],
-        });
+        match &mut self.sujo {
+            None => {
+                self.sujo = Some([x0, y0, x1, y1]);
+                avisa_sujeira(self.serie);
+            }
+            Some([a, b, c, d]) => {
+                *a = (*a).min(x0);
+                *b = (*b).min(y0);
+                *c = (*c).max(x1);
+                *d = (*d).max(y1);
+            }
+        }
+    }
+
+    /// A linha `y`, de `x0` a `x1`, para escrever direto — sem conferência por pixel.
+    ///
+    /// Quem escreve tem de ter recortado antes e avisar depois com [`Framebuffer::marca`]:
+    /// é o par que tira dos laços de sprite a conferência de borda, a conta do índice e a
+    /// caixa suja de cada pixel.
+    #[inline]
+    pub fn linha_mut(&mut self, y: u32, x0: u32, x1: u32) -> &mut [u16] {
+        let base = (y * self.width) as usize;
+        &mut self.pixels[base + x0 as usize..base + x1 as usize]
+    }
+
+    /// A linha `y`, de `x0` a `x1`, para ler.
+    #[inline]
+    pub fn linha(&self, y: u32, x0: u32, x1: u32) -> &[u16] {
+        let base = (y * self.width) as usize;
+        &self.pixels[base + x0 as usize..base + x1 as usize]
+    }
+
+    /// Registra `escritas` pixels escritos por [`Framebuffer::linha_mut`] dentro de
+    /// `[x0, x1) × [y0, y1)`. Nenhuma escrita, nenhuma mudança — como no caminho pixel a pixel.
+    #[inline]
+    pub fn marca(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, escritas: u64) {
+        if escritas == 0 {
+            return;
+        }
+        self.touched += escritas;
+        self.suja(x0, y0, x1, y1);
     }
 
     pub fn width(&self) -> u32 {
@@ -224,13 +314,13 @@ impl Framebuffer {
         let y0 = rect.y.max(0) as u32;
         let x1 = ((rect.x as i32 + rect.width as i32).max(0) as u32).min(self.width);
         let y1 = ((rect.y as i32 + rect.height as i32).max(0) as u32).min(self.height);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                self.pixels[(y * self.width + x) as usize] = value;
-                self.touched += 1;
-            }
+        if x0 >= x1 || y0 >= y1 {
+            return;
         }
-        self.suja(x0, y0, x1, y1);
+        for y in y0..y1 {
+            self.linha_mut(y, x0, x1).fill(value);
+        }
+        self.marca(x0, y0, x1, y1, u64::from(x1 - x0) * u64::from(y1 - y0));
     }
 
     /// Desenha a moldura de um retângulo, um pixel de espessura.
@@ -277,15 +367,14 @@ impl Framebuffer {
             .max(0)
             .min(self.height as i32);
         let (x0, y0) = (rect.x.max(0) as i32, rect.y.max(0) as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let (x0, y0, x1, y1) = (x0 as u32, y0 as u32, x1 as u32, y1 as u32);
         for y in y0..y1 {
-            for x in x0..x1 {
-                self.pixels[(y as u32 * self.width + x as u32) as usize] = value;
-                self.touched += 1;
-            }
+            self.linha_mut(y, x0, x1).fill(value);
         }
-        if x0 < x1 && y0 < y1 {
-            self.suja(x0 as u32, y0 as u32, x1 as u32, y1 as u32);
-        }
+        self.marca(x0, y0, x1, y1, u64::from(x1 - x0) * u64::from(y1 - y0));
     }
 
     /// Copia uma região de `src` para dentro desta superfície.
@@ -307,19 +396,46 @@ impl Framebuffer {
         src_y: i32,
         transparent: Option<u16>,
     ) {
-        for row in 0..height {
-            for col in 0..width {
-                let (sx, sy) = (src_x + col, src_y + row);
-                if sx < 0 || sy < 0 || sx >= src.width as i32 || sy >= src.height as i32 {
-                    continue;
+        // O recorte sai uma vez, antes do laço: as colunas e linhas que caem dentro das duas
+        // superfícies ao mesmo tempo. Dali para dentro é cópia de linha — `copy_from_slice`
+        // sem cor-chave, e uma comparação por pixel com ela. O laço antigo conferia as quatro
+        // bordas das duas superfícies, recalculava o índice e estendia a caixa suja a cada
+        // pixel: 3,1% do processador no Pac-Mania, fora o contador atômico.
+        let (dst_x, dst_y, src_x, src_y) =
+            (i64::from(dst_x), i64::from(dst_y), i64::from(src_x), i64::from(src_y));
+        let c0 = 0i64.max(-src_x).max(-dst_x);
+        let c1 = i64::from(width)
+            .min(i64::from(src.width) - src_x)
+            .min(i64::from(self.width) - dst_x);
+        let r0 = 0i64.max(-src_y).max(-dst_y);
+        let r1 = i64::from(height)
+            .min(i64::from(src.height) - src_y)
+            .min(i64::from(self.height) - dst_y);
+        if c0 >= c1 || r0 >= r1 {
+            return;
+        }
+        let (sx0, sx1) = ((src_x + c0) as u32, (src_x + c1) as u32);
+        let (dx0, dx1) = ((dst_x + c0) as u32, (dst_x + c1) as u32);
+        let mut escritas = 0u64;
+        for row in r0..r1 {
+            let origem = src.linha((src_y + row) as u32, sx0, sx1);
+            let destino = self.linha_mut((dst_y + row) as u32, dx0, dx1);
+            match transparent {
+                None => {
+                    destino.copy_from_slice(origem);
+                    escritas += origem.len() as u64;
                 }
-                let value = src.get_pixel(sx, sy);
-                if Some(value) == transparent {
-                    continue;
+                Some(chave) => {
+                    for (d, &o) in destino.iter_mut().zip(origem) {
+                        if o != chave {
+                            *d = o;
+                            escritas += 1;
+                        }
+                    }
                 }
-                self.set_pixel_native(dst_x + col, dst_y + row, value);
             }
         }
+        self.marca(dx0, (dst_y + r0) as u32, dx1, (dst_y + r1) as u32, escritas);
     }
 
     /// Traça uma linha pelo algoritmo de Bresenham — só inteiros, como o hardware da época.
@@ -428,10 +544,7 @@ impl Framebuffer {
     /// entrega 60 quadros por segundo isso é lixo a cada 16 ms, e o coletor aparece como engasgo.
     pub fn write_rgb565_into(&self, out: &mut Vec<u8>) {
         out.clear();
-        out.reserve(self.pixels.len() * 2);
-        for pixel in &self.pixels {
-            out.extend_from_slice(&pixel.to_le_bytes());
-        }
+        out.extend_from_slice(&self.rgb565_fatia(0, self.pixels.len()));
     }
 
     /// Assinatura barata do conteúdo da tela, para reconhecer quadro repetido.

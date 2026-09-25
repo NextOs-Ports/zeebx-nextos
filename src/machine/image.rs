@@ -660,6 +660,52 @@ impl<C: CpuBackend> Machine<C> {
         first_row = first_row.max(-y).max(0);
         last_row = last_row.min(surface.height() as i32 - y);
 
+        if first_column >= last_column || first_row >= last_row {
+            return Ok(());
+        }
+        // **Linha a linha, sem conferência por pixel**, no caso comum: a linha inteira da origem
+        // existe e o alfa, quando há, cobre a linha. O laço genérico abaixo fica para o resto
+        // (o quadro de uma tira que passa do fim da imagem), e os dois escrevem o mesmo pixel.
+        let colunas = (last_column - first_column) as usize;
+        let linha_de = |row: i32| {
+            ((row + recorte_y) as u32 * info.width + (first_column + recorte_x) as u32 + offset)
+                as usize
+        };
+        let cabe = |inicio: usize| {
+            inicio + colunas <= info.pixels.len()
+                && (info.alfa.is_empty() || inicio + colunas <= info.alfa.len())
+                && (!info.alfa.is_empty() || inicio + colunas <= info.opaque.len())
+        };
+        if cabe(linha_de(first_row)) && cabe(linha_de(last_row - 1)) {
+            let (x0, x1) = ((x + first_column) as u32, (x + last_column) as u32);
+            let chave = recorte.transparente.then_some(TRANSPARENT_KEY);
+            let mut escritas = 0u64;
+            for row in first_row..last_row {
+                let inicio = linha_de(row);
+                let origem = &info.pixels[inicio..inicio + colunas];
+                let destino = surface.linha_mut((y + row) as u32, x0, x1);
+                if info.alfa.is_empty() {
+                    let opaco = &info.opaque[inicio..inicio + colunas];
+                    for ((d, &o), &visivel) in destino.iter_mut().zip(origem).zip(opaco) {
+                        if visivel && Some(o) != chave {
+                            *d = o;
+                            escritas += 1;
+                        }
+                    }
+                } else {
+                    let alfa = &info.alfa[inicio..inicio + colunas];
+                    for ((d, &o), &a) in destino.iter_mut().zip(origem).zip(alfa) {
+                        if a == 0 || Some(o) == chave {
+                            continue;
+                        }
+                        *d = if a == u8::MAX { o } else { mistura_rgb565(*d, o, a) };
+                        escritas += 1;
+                    }
+                }
+            }
+            surface.marca(x0, (y + first_row) as u32, x1, (y + last_row) as u32, escritas);
+            return Ok(());
+        }
         for row in first_row..last_row {
             for column in first_column..last_column {
                 let source = ((row + recorte_y) as u32 * info.width
