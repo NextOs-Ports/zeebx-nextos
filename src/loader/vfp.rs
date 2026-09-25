@@ -202,6 +202,8 @@ pub struct Troca {
 pub struct Trampolins {
     pub novos: Vec<u8>,
     pub antigos: Vec<u8>,
+    /// Chamadas embutidas em trampolins de outras (ver `estende`), para o relatório.
+    pub embutidas: u32,
 }
 
 /// `b` (sempre) de `pc` para `alvo`, se couber no alcance.
@@ -340,6 +342,9 @@ pub fn acelera(modulo: &mut [u8], base: u32) -> (Trampolins, Vec<Troca>) {
     // continua no trampolim comum, que volta pelo `lr` de quem chamou.
     let mapa: rustc_hash::FxHashMap<u32, (u32, &'static [u32], usize)> =
         redireciona.iter().enumerate().map(|(k, &(e, d, c))| (e, (d, c, k))).collect();
+    // O código como estava antes de reescrever as chamadas, para copiar os trechos.
+    let original = modulo.to_vec();
+    let mut embutidas_total = 0u32;
     for i in (0..modulo.len().saturating_sub(3)).step_by(4) {
         let w = palavra(modulo, i);
         if w & 0x0e00_0000 != 0x0a00_0000 || w >> 28 == 0xf {
@@ -351,15 +356,29 @@ pub fn acelera(modulo: &mut [u8], base: u32) -> (Trampolins, Vec<Troca>) {
             continue;
         };
         let proprio = VFP_BASE + (novos.len() * 4) as u32;
-        let volta = proprio + ((corpo.len() - 1) * 4) as u32;
         let so_dele = w & 0x0100_0000 != 0 && corpo.last() == Some(&BX_LR);
-        let novo = match so_dele.then(|| (desvio(pc, proprio, (w & 0xf000_0000) | 0x0a00_0000), desvio(volta, pc + 4, 0xea00_0000))) {
-            Some((Some(ida), Some(b_volta))) => {
-                novos.extend_from_slice(&corpo[..corpo.len() - 1]);
-                novos.push(b_volta);
-                Some(ida)
+        let novo = match so_dele.then(|| desvio(pc, proprio, (w & 0xf000_0000) | 0x0a00_0000)).flatten() {
+            Some(ida) => {
+                // A conta, e o trecho reto que vem depois da chamada copiado junto (ver
+                // `estende`), para o Dynarmic traduzir tudo num bloco só.
+                let mut seq = corpo[..corpo.len() - 1].to_vec();
+                let (seguinte, embutidas) = if w >> 28 == 0xe {
+                    estende(&original, base, i + 4, &mapa, &mut seq)
+                } else {
+                    (pc + 4, 0) // chamada condicional: só a conta
+                };
+                let b_volta = desvio(proprio + (seq.len() * 4) as u32, seguinte, 0xea00_0000);
+                match b_volta {
+                    Some(b) => {
+                        seq.push(b);
+                        novos.extend_from_slice(&seq);
+                        embutidas_total += embutidas;
+                        Some(ida)
+                    }
+                    None => desvio(pc, comum, w & 0xff00_0000),
+                }
             }
-            _ => desvio(pc, comum, w & 0xff00_0000),
+            None => desvio(pc, comum, w & 0xff00_0000),
         };
         if let Some(novo) = novo {
             modulo[i..i + 4].copy_from_slice(&novo.to_le_bytes());
@@ -367,7 +386,85 @@ pub fn acelera(modulo: &mut [u8], base: u32) -> (Trampolins, Vec<Troca>) {
         }
     }
     let bytes = |v: &[u32]| v.iter().flat_map(|w| w.to_le_bytes()).collect();
-    (Trampolins { novos: bytes(&novos), antigos: bytes(&antigos) }, trocas)
+    (Trampolins { novos: bytes(&novos), antigos: bytes(&antigos), embutidas: embutidas_total }, trocas)
+}
+
+/// Quantas instruções do jogo, no máximo, um trampolim copia depois da chamada.
+const TRECHO_MAXIMO: usize = 48;
+
+/// Copia para `seq` o trecho reto que segue a chamada em `off`, até a primeira instrução que não
+/// pode mudar de endereço, e embute no lugar as chamadas (`bl` incondicional) a outras rotinas
+/// trocadas. Devolve o endereço da primeira instrução não copiada (para onde o trampolim volta)
+/// e quantas chamadas foram embutidas.
+///
+/// **Por quê.** Cada conta de `float` por trampolim custa dois blocos a mais no Dynarmic — o do
+/// trampolim e o que recomeça depois da chamada —, e em cada um o JIT recarrega do estado os
+/// registradores do guest que usa e grava de volta os que sujou. O laço de partículas do Quake faz
+/// ~50 contas em linha reta por partícula (`fsub`, `fmul`, `fadd`, `ffix` intercalados com
+/// `ldr`/`str`): copiado, vira um bloco só, e os valores ficam nos registradores do host.
+///
+/// O original fica intacto: a cópia só é alcançada pelo `bl` reescrito. Por isso a cópia não
+/// pode ler o PC (literal, `add rX, pc`), desviar, nem escrever o PC; ao achar uma dessas, pára
+/// ali e volta ao original. O `lr` não é escrito pelas chamadas embutidas: depois de um `bl` o
+/// compilador o trata como destruído.
+fn estende(
+    original: &[u8],
+    base: u32,
+    mut off: usize,
+    mapa: &rustc_hash::FxHashMap<u32, (u32, &'static [u32], usize)>,
+    seq: &mut Vec<u32>,
+) -> (u32, u32) {
+    let mut embutidas = 0;
+    for _ in 0..TRECHO_MAXIMO {
+        if off + 4 > original.len() {
+            break;
+        }
+        let w = palavra(original, off);
+        let pc = base.wrapping_add(off as u32);
+        if w >> 24 == 0xeb {
+            let desloc = (((w & 0x00ff_ffff) << 8) as i32 >> 6) as u32;
+            match mapa.get(&pc.wrapping_add(8).wrapping_add(desloc)) {
+                Some(&(_, corpo, _)) if corpo.last() == Some(&BX_LR) => {
+                    seq.extend_from_slice(&corpo[..corpo.len() - 1]);
+                    embutidas += 1;
+                }
+                _ => break,
+            }
+        } else if copiavel(w) {
+            seq.push(w);
+        } else {
+            break;
+        }
+        off += 4;
+    }
+    (base.wrapping_add(off as u32), embutidas)
+}
+
+/// Uma instrução ARM que faz a mesma coisa em qualquer endereço: sem ler nem escrever o PC, sem
+/// desviar, sem coprocessador nem chamada de sistema. Conservadora: um campo de registrador com
+/// valor 15 recusa a instrução mesmo quando, naquela codificação, o campo é parte de um imediato.
+fn copiavel(w: u32) -> bool {
+    let cond = w >> 28;
+    if cond == 0xf {
+        return false;
+    }
+    let pc_em = |bit: u32| (w >> bit) & 0xf == 0xf;
+    match (w >> 25) & 7 {
+        // Processamento de dados, multiplicação, transferências de meia palavra/dupla e o grupo
+        // "misc" (MRS/MSR/BX/BLX/CLZ...), que fica de fora inteiro.
+        0b000 | 0b001 => {
+            let misc = w & 0x0190_0000 == 0x0100_0000 && (w >> 25) & 1 == 0 && w & 0x90 != 0x90;
+            let msr_imediato = w & 0x0fb0_0000 == 0x0320_0000;
+            !misc && !msr_imediato && !pc_em(16) && !pc_em(12) && !pc_em(0) && !(w & 0x0200_0010 == 0x10 && pc_em(8))
+        }
+        // As extensões do ARMv6 (uxth, sxtb, ...): Rn = 15 quer dizer "sem somar", não PC.
+        0b011 if w & 0x0f80_03f0 == 0x0680_0070 => !pc_em(12) && !pc_em(0),
+        // LDR/STR/LDRB/STRB e, com o bit 4, o resto das de mídia do ARMv6.
+        0b010 | 0b011 => !pc_em(16) && !pc_em(12) && !((w >> 25) & 1 == 1 && pc_em(0)),
+        // LDM/STM sem o PC na lista nem como base.
+        0b100 => !pc_em(16) && w & 0x8000 == 0,
+        _ => false,
+    }
 }
 
 /// As assinaturas, na ordem de [`ROTINAS`] e depois [`COMPARACOES`], para testes de outros
@@ -426,6 +523,7 @@ mod tests {
         m[0..4].copy_from_slice(&bl(0, 0x200, 0xeb00_0000).to_le_bytes());
         m[0x10..0x14].copy_from_slice(&bl(0x10, 0x200, 0x1a00_0000).to_le_bytes());
         m[0x20..0x24].copy_from_slice(&bl(0x20, 0x300, 0xeb00_0000).to_le_bytes());
+        m[4..8].copy_from_slice(&BX_LR.to_le_bytes()); // não copiável: o trecho pára aqui
         let (tramp, trocas) = acelera(&mut m, 0x1_0000);
         assert_eq!(trocas[0].chamadas, 2);
         // O `bl` vira `b` para um trampolim só dele, depois do comum (5 palavras)...
@@ -440,6 +538,58 @@ mod tests {
         assert_eq!(destino_em(&m, 0x1_0000, 0x10), VFP_BASE);
         assert_eq!(palavra(&m, 0x10) >> 24, 0x1a, "continua bne");
         assert_eq!(destino_em(&m, 0x1_0000, 0x20), 0x1_0300, "a outra chamada fica");
+    }
+
+    #[test]
+    fn trecho_reto_depois_da_chamada_vai_junto_e_embute_a_proxima_conta() {
+        let mut m = modulo_com(&[(ROTINAS[2].assinatura, 0x200)], 0x400);
+        let bl = |de: u32, para: u32| 0xeb00_0000 | (((para - de - 8) / 4) & 0x00ff_ffff);
+        let codigo = [
+            bl(0, 0x200),
+            0xe594_1000, // ldr r1, [r4]
+            bl(8, 0x200),
+            0xe585_0000, // str r0, [r5]
+            0xe59f_0008, // ldr r0, [pc, #8]: lê o PC, a cópia pára aqui
+        ];
+        for (k, w) in codigo.iter().enumerate() {
+            m[4 * k..4 * k + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let (tramp, trocas) = acelera(&mut m, 0x1_0000);
+        assert_eq!(tramp.embutidas, 1);
+        assert_eq!(trocas[0].chamadas, 2, "as duas chamadas reescritas");
+        // O trampolim da primeira: conta, ldr, conta, str, e volta ao `ldr r0, [pc]`.
+        let t = &tramp.novos[20..];
+        let fmul = &ROTINAS[2].corpo[..4];
+        let esperado: Vec<u32> =
+            fmul.iter().chain(&[0xe594_1000]).chain(fmul).chain(&[0xe585_0000]).copied().collect();
+        for (k, w) in esperado.iter().enumerate() {
+            assert_eq!(palavra(t, 4 * k), *w, "palavra {k}");
+        }
+        assert_eq!(destino_em(t, VFP_BASE + 20, 4 * esperado.len()), 0x1_0010);
+    }
+
+    #[test]
+    fn copiavel_recusa_o_que_depende_do_endereco() {
+        for (w, ok, o_que) in [
+            (0xe28f_0004, false, "add r0, pc, #4"),
+            (0xe1a0_f00e, false, "mov pc, lr"),
+            (0xe59f_0000, false, "ldr r0, [pc]"),
+            (0xe92d_4010, true, "push {r4, lr}"),
+            (0xe8bd_8010, false, "pop {r4, pc}"),
+            (0xe6ff_2072, true, "uxth r2, r2"),
+            (0xe12f_ff1e, false, "bx lr"),
+            (0xe000_0291, true, "mul r0, r1, r2"),
+            (0xe350_0000, true, "cmp r0, #0"),
+            (0x13a0_1001, true, "movne r1, #1"),
+            (0xe328_f000, false, "msr cpsr_f, #0"),
+            (0xef00_0000, false, "svc 0"),
+            (0xee30_0a20, false, "vadd.f32"),
+            (0xea00_0000, false, "b"),
+            (0xe1d0_00b2, true, "ldrh r0, [r0, #2]"),
+            (0xe10f_0000, false, "mrs r0, cpsr"),
+        ] {
+            assert_eq!(copiavel(w), ok, "{o_que}");
+        }
     }
 
     #[test]

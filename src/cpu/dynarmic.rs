@@ -1148,13 +1148,15 @@ mod tests {
         for (k, w) in fmul.iter().enumerate() {
             modulo[0x200 + 4 * k..0x204 + 4 * k].copy_from_slice(&w.to_le_bytes());
         }
-        // 0x40: bl 0x200 ; 0x44: add r0, r0, #0 (sinal de que voltou aqui) ; 0x48: bx r4
-        let bl = 0xeb00_0000u32 | ((0x200 - 0x40 - 8) >> 2);
-        modulo[0x40..0x44].copy_from_slice(&bl.to_le_bytes());
-        modulo[0x44..0x48].copy_from_slice(&0xe280_0000u32.to_le_bytes());
-        modulo[0x48..0x4c].copy_from_slice(&0xe12f_ff14u32.to_le_bytes());
+        // 0x40: bl fmul ; 0x44: mov r1, r0 ; 0x48: bl fmul ; 0x4c: bx r4 (fim do trecho copiado)
+        let bl = |de: u32| 0xeb00_0000u32 | ((0x200 - de - 8) >> 2);
+        modulo[0x40..0x44].copy_from_slice(&bl(0x40).to_le_bytes());
+        modulo[0x44..0x48].copy_from_slice(&0xe1a0_1000u32.to_le_bytes());
+        modulo[0x48..0x4c].copy_from_slice(&bl(0x48).to_le_bytes());
+        modulo[0x4c..0x50].copy_from_slice(&0xe12f_ff14u32.to_le_bytes());
         let (trampolins, trocas) = vfp::acelera(&mut modulo, 0);
-        assert_eq!(trocas[0].chamadas, 1);
+        assert_eq!(trocas[0].chamadas, 2);
+        assert_eq!(trampolins.embutidas, 1, "a segunda conta vai dentro do trampolim da primeira");
         assert_eq!(modulo[0x43], 0xea, "o bl virou b");
         let mut mem = GuestMemory::new();
         mem.map("code", 0, modulo, true).unwrap();
@@ -1167,7 +1169,7 @@ mod tests {
         cpu.write_reg(Reg::R1, 0.5f32.to_bits());
         cpu.write_reg(Reg::R4, RETURN_MAGIC);
         assert_eq!(cpu.run(0x40, 100).unwrap(), StopReason::Returned);
-        assert_eq!(cpu.read_reg(Reg::R0), 1.5f32.to_bits());
+        assert_eq!(cpu.read_reg(Reg::R0), 2.25f32.to_bits(), "3 × 0,5 = 1,5; 1,5 × 1,5");
     }
 
     #[test]

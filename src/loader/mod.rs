@@ -230,7 +230,11 @@ pub fn load_with(
                     .iter()
                     .map(|t| format!("{}@{:#x} ({} chamadas)", t.nome, t.entrada, t.chamadas))
                     .collect();
-                eprintln!("Zeebx: float por software trocado por VFP: {}", lista.join(", "));
+                eprintln!(
+                    "Zeebx: float por software trocado por VFP: {} ({} chamadas embutidas)",
+                    lista.join(", "),
+                    trampolins.embutidas
+                );
             }
             trampolins
         }

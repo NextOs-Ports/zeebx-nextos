@@ -22,4 +22,7 @@ flock 9
 echo "[$FRENTE] aparelho livre" >&2
 scp -q "$SO" "root@192.168.31.30:$DEST"
 scp -q "$(dirname "$0")/mede.sh" root@192.168.31.30:/storage/roms/zeebo/.log/mede.sh
-ssh root@192.168.31.30 "cd /storage/roms/zeebo/.log; ${EXTRA_ENV:-} CORE=$DEST TAG=$FRENTE sh mede.sh $Q $*"
+# Segunda trava, NO APARELHO: matar este script no PC libera a trava daqui, mas o RetroArch
+# remoto continua vivo; com a trava de lá, a próxima medida espera ele terminar (o mede.sh tem
+# timeout por jogo). Aviso da frente guest, 25/09.
+ssh root@192.168.31.30 "cd /storage/roms/zeebo/.log; flock /storage/roms/zeebo/.log/aparelho.lock env ${EXTRA_ENV:-} CORE=$DEST TAG=$FRENTE sh mede.sh $Q $*"
