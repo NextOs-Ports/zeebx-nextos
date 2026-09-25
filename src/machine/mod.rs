@@ -238,65 +238,79 @@ fn bytes_per_texel(format: u32, kind: u32) -> u32 {
     }
 }
 
+/// A expansão de um campo de `bits` para 8 bits, arredondada: `(v * 255 + max / 2) / max`.
+///
+/// Repetir os cinco bits mais altos nos três de baixo espalha o valor por toda a faixa: é o que
+/// faz 0b11111 virar 255 e não 248. Em tabela porque a divisão por texel pesava: o Caveman Ninja
+/// e o FIFA 09 sobem uma textura por quadro (2,3 e 3,6 ms/q no Mali-450), e cada texel de 565
+/// fazia três divisões inteiras.
+const fn tabela_de_expansao<const N: usize>(bits: u32) -> [u8; N] {
+    let max = (1u32 << bits) - 1;
+    let mut t = [0u8; N];
+    let mut v = 0;
+    while v < N {
+        t[v] = ((v as u32 * 255 + max / 2) / max) as u8;
+        v += 1;
+    }
+    t
+}
+static EXPANDE4: [u8; 16] = tabela_de_expansao::<16>(4);
+static EXPANDE5: [u8; 32] = tabela_de_expansao::<32>(5);
+static EXPANDE6: [u8; 64] = tabela_de_expansao::<64>(6);
+
 /// Converte os texels para RGBA de 8 bits, o formato único do rasterizador.
+///
+/// O formato é decidido uma vez, fora do laço: dentro dele, o `match` por texel impedia o
+/// compilador de vetorizar a cópia dos formatos de 8 bits.
 fn decode_texels(bytes: &[u8], format: u32, kind: u32, count: usize) -> Vec<[u8; 4]> {
-    // Repetir os cinco bits mais altos nos três de baixo espalha o valor por toda a faixa: é o
-    // que faz 0b11111 virar 255 e não 248.
-    let expand = |value: u16, bits: u32| -> u8 {
-        let max = (1u16 << bits) - 1;
-        ((value as u32 * 255 + max as u32 / 2) / max as u32) as u8
-    };
     let size = bytes_per_texel(format, kind) as usize;
-    (0..count)
-        .map(|i| {
-            let at = i * size;
-            if at + size > bytes.len() {
-                return [255; 4];
+    let cabem = (bytes.len() / size).min(count);
+    let mut saida: Vec<[u8; 4]> = Vec::with_capacity(count);
+    let dezesseis = |i: usize| u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+    match kind {
+        gles::GL_UNSIGNED_SHORT_5_6_5 => saida.extend((0..cabem).map(|i| {
+            let v = dezesseis(i) as usize;
+            [EXPANDE5[v >> 11], EXPANDE6[(v >> 5) & 0x3f], EXPANDE5[v & 0x1f], 255]
+        })),
+        gles::GL_UNSIGNED_SHORT_4_4_4_4 => saida.extend((0..cabem).map(|i| {
+            let v = dezesseis(i) as usize;
+            [EXPANDE4[v >> 12], EXPANDE4[(v >> 8) & 0xf], EXPANDE4[(v >> 4) & 0xf], EXPANDE4[v & 0xf]]
+        })),
+        gles::GL_UNSIGNED_SHORT_5_5_5_1 => saida.extend((0..cabem).map(|i| {
+            let v = dezesseis(i) as usize;
+            [
+                EXPANDE5[v >> 11],
+                EXPANDE5[(v >> 6) & 0x1f],
+                EXPANDE5[(v >> 1) & 0x1f],
+                if v & 1 != 0 { 255 } else { 0 },
+            ]
+        })),
+        // Tipo que não conhecemos: o texel ocupa dois bytes (ver `bytes_per_texel`) e o formato
+        // lê o que der dali, como sempre leu. Sem pressa: nenhum jogo medido cai aqui.
+        k if k != gles::GL_UNSIGNED_BYTE => saida.extend((0..cabem).map(|i| {
+            let em = |d: usize| bytes.get(i * size + d).copied().unwrap_or(255);
+            match format {
+                gles::GL_RGB => [em(0), em(1), em(2), 255],
+                gles::GL_RGBA => [em(0), em(1), em(2), em(3)],
+                gles::GL_LUMINANCE_ALPHA => [em(0), em(0), em(0), em(1)],
+                gles::GL_ALPHA => [255, 255, 255, em(0)],
+                _ => [em(0), em(0), em(0), 255],
             }
-            match kind {
-                gles::GL_UNSIGNED_SHORT_5_6_5 => {
-                    let v = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-                    [
-                        expand(v >> 11, 5),
-                        expand((v >> 5) & 0x3f, 6),
-                        expand(v & 0x1f, 5),
-                        255,
-                    ]
-                }
-                gles::GL_UNSIGNED_SHORT_4_4_4_4 => {
-                    let v = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-                    [
-                        expand(v >> 12, 4),
-                        expand((v >> 8) & 0xf, 4),
-                        expand((v >> 4) & 0xf, 4),
-                        expand(v & 0xf, 4),
-                    ]
-                }
-                gles::GL_UNSIGNED_SHORT_5_5_5_1 => {
-                    let v = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-                    [
-                        expand(v >> 11, 5),
-                        expand((v >> 6) & 0x1f, 5),
-                        expand((v >> 1) & 0x1f, 5),
-                        if v & 1 != 0 { 255 } else { 0 },
-                    ]
-                }
-                _ => match format {
-                    gles::GL_RGB => [bytes[at], bytes[at + 1], bytes[at + 2], 255],
-                    gles::GL_RGBA => [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]],
-                    gles::GL_LUMINANCE_ALPHA => {
-                        let l = bytes[at];
-                        [l, l, l, bytes[at + 1]]
-                    }
-                    gles::GL_ALPHA => [255, 255, 255, bytes[at]],
-                    gles::GL_LUMINANCE => [bytes[at], bytes[at], bytes[at], 255],
-                    // Formato que não conhecemos: um canal só, opaco. Vira cinza, e cinza é
-                    // visível — errar assim aparece na tela em vez de virar um buraco preto.
-                    _ => [bytes[at], bytes[at], bytes[at], 255],
-                },
-            }
-        })
-        .collect()
+        })),
+        _ => match format {
+            gles::GL_RGB => saida.extend(bytes.chunks_exact(3).take(cabem).map(|t| [t[0], t[1], t[2], 255])),
+            gles::GL_RGBA => saida.extend(bytes.chunks_exact(4).take(cabem).map(|t| [t[0], t[1], t[2], t[3]])),
+            gles::GL_LUMINANCE_ALPHA => saida.extend(bytes.chunks_exact(2).take(cabem).map(|t| [t[0], t[0], t[0], t[1]])),
+            gles::GL_ALPHA => saida.extend(bytes[..cabem].iter().map(|&a| [255, 255, 255, a])),
+            gles::GL_LUMINANCE => saida.extend(bytes[..cabem].iter().map(|&l| [l, l, l, 255])),
+            // Formato que não conhecemos: um canal só, opaco. Vira cinza, e cinza é visível —
+            // errar assim aparece na tela em vez de virar um buraco preto.
+            _ => saida.extend(bytes[..cabem].iter().map(|&l| [l, l, l, 255])),
+        },
+    }
+    // O que passa do fim do que o jogo mandou sai branco opaco, como sempre saiu.
+    saida.resize(count, [255; 4]);
+    saida
 }
 
 /// A classe que sabe abrir um tipo MIME, para o `ISHELL_GetHandler`.
