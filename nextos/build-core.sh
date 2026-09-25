@@ -12,6 +12,16 @@ SR=$TC/$TRIPLO/sysroot
 [ -x "$TC/bin/$TRIPLO-gcc" ] || { echo "toolchain não encontrado: $TC" >&2; exit 1; }
 cd "$(dirname "$0")/.."
 
+# Vários worktrees (agentes) compartilham um diretório de build: o disco não comporta um por
+# worktree. A trava serializa compilar + copiar, senão um agente copiaria o .so do outro.
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/home/felipe/zeebx-nextos/target}
+# O build de perfil muda as flags de compilação: em diretório próprio, senão invalidaria o outro.
+[ -n "${ZEEBX_PERFIL:-}" ] && export CARGO_TARGET_DIR=/home/felipe/zeebx-nextos/target-perfil
+if [ -z "${ZEEBX_TRAVA_BUILD:-}" ]; then
+  export ZEEBX_TRAVA_BUILD=1
+  exec flock /home/felipe/zeebx-nextos/.build.lock "$0" "$@"
+fi
+
 T=aarch64-unknown-linux-gnu
 TU=aarch64_unknown_linux_gnu
 export CC_$TU="$TC/bin/$TRIPLO-gcc"
@@ -41,7 +51,7 @@ CM
 export CMAKE_TOOLCHAIN_FILE_$TU="$TCFILE"
 
 cargo build --release --locked --target $T -p zeebx-libretro "$@"
-SO=target/$T/release/libzeebx_libretro.so
+SO=$CARGO_TARGET_DIR/$T/release/libzeebx_libretro.so
 file "$SO" | cut -d, -f1-3
 "$TC/bin/$TRIPLO-readelf" -d "$SO" | grep -E "NEEDED|RPATH|RUNPATH" || true
 "$TC/bin/$TRIPLO-readelf" -V "$SO" | grep -oE 'GLIBC_[0-9.]+|GLIBCXX_[0-9.]+' | sort -Vu | tail -2
