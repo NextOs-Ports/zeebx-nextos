@@ -5,4 +5,5 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR=/home/felipe/zeebx-nextos/target
-exec flock /home/felipe/zeebx-nextos/.build.lock cargo test --locked -p zeebx --lib "$@"
+# Toca as fontes: o diretório compartilhado não separa worktrees (ver build-core.sh).
+exec flock /home/felipe/zeebx-nextos/.build.lock sh -c 'find src -type f -exec touch {} + ; exec cargo test --locked -p zeebx --lib "$@"' sh "$@"
