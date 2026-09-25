@@ -733,6 +733,16 @@ pub trait Rasterizador {
     ) -> Result<(), Option<(u32, u32)>>;
 
     fn draw(&mut self, mode: u32, vertices: &[Vertex]);
+    /// O mesmo desenho que `draw` com `indices.iter().map(|i| vertices[i])`, sem repetir o
+    /// vértice compartilhado.
+    ///
+    /// Quem desenha na placa aproveita: cada vértice passa uma vez pela etapa de vértice e vai
+    /// uma vez à placa, e a faixa e o leque viram índices em vez de cópias. O rasterizador de
+    /// software recebe a lista expandida, exatamente como antes.
+    fn draw_indexado(&mut self, mode: u32, vertices: &[Vertex], indices: &[u32]) {
+        let expandidos: Vec<Vertex> = indices.iter().map(|&i| vertices[i as usize]).collect();
+        self.draw(mode, &expandidos);
+    }
     fn draw_texture(&mut self, x: f32, y: f32, z: f32, width: f32, height: f32);
 
     fn read_rect(&mut self, x: i32, y: i32, width: usize, height: usize) -> Vec<[u8; 4]>;
@@ -1539,6 +1549,95 @@ impl GlState {
     /// tudo opaco. Com `GL_COLOR_MATERIAL`, a cor do vértice toma o lugar da ambiente e da
     /// difusa do material — é o único caminho pelo qual um vetor de cores continua valendo com
     /// a luz ligada.
+    /// A mesma conta de [`GlState::cor_iluminada`], com o que é de cada luz já pronto.
+    ///
+    /// **A etapa de vértice era 17,7% do processador no Galaxy on Fire** (quadro 1800, Mali-450),
+    /// e a maior parte era refazer por vértice o que é do desenho: normalizar a direção de cada
+    /// luz direcional, o cosseno do corte do holofote, e o vetor para o olho mesmo sem especular.
+    /// As contas por vértice são as mesmas, na mesma ordem: o resultado é bit a bit o de antes.
+    fn cor_iluminada_com(
+        &self,
+        luzes: &[LuzPronta],
+        olho: [f32; 4],
+        normal: [f32; 3],
+        cor_do_vertice: [f32; 4],
+    ) -> [f32; 4] {
+        let (ambiente, difusa) = match self.color_material {
+            true => (cor_do_vertice, cor_do_vertice),
+            false => (self.material.ambient, self.material.diffuse),
+        };
+        let mut saida = [0.0f32; 3];
+        for canal in 0..3 {
+            saida[canal] =
+                self.material.emission[canal] + ambiente[canal] * self.light_model_ambient[canal];
+        }
+        let mut para_o_olho: Option<[f32; 3]> = None;
+        for luz in luzes {
+            let (para_a_luz, distancia) = match luz.direcao {
+                Some(direcao) => (direcao, None),
+                None => {
+                    let bruto = [
+                        luz.posicao[0] - olho[0],
+                        luz.posicao[1] - olho[1],
+                        luz.posicao[2] - olho[2],
+                    ];
+                    (normaliza(bruto), Some(comprimento(bruto)))
+                }
+            };
+            let atenuacao = match distancia {
+                None => 1.0,
+                Some(d) => {
+                    let [c, l, q] = luz.atenuacao;
+                    let divisor = c + l * d + q * d * d;
+                    if divisor <= 0.0 { 1.0 } else { 1.0 / divisor }
+                }
+            };
+            let holofote = match luz.holofote {
+                None => 1.0,
+                Some((eixo, corte, expoente)) => {
+                    let cos = ponto(eixo, [-para_a_luz[0], -para_a_luz[1], -para_a_luz[2]]);
+                    match cos < corte {
+                        true => 0.0,
+                        false => cos.max(0.0).powf(expoente),
+                    }
+                }
+            };
+            let peso = atenuacao * holofote;
+            if peso <= 0.0 {
+                continue;
+            }
+            let n_l = ponto(normal, para_a_luz).max(0.0);
+            let brilho = match n_l > 0.0 && self.material.shininess > 0.0 {
+                false => 0.0,
+                true => {
+                    let para_o_olho = *para_o_olho
+                        .get_or_insert_with(|| normaliza([-olho[0], -olho[1], -olho[2]]));
+                    let meio = normaliza([
+                        para_a_luz[0] + para_o_olho[0],
+                        para_a_luz[1] + para_o_olho[1],
+                        para_a_luz[2] + para_o_olho[2],
+                    ]);
+                    ponto(normal, meio).max(0.0).powf(self.material.shininess)
+                }
+            };
+            for canal in 0..3 {
+                saida[canal] += peso
+                    * (ambiente[canal] * luz.ambiente[canal]
+                        + difusa[canal] * luz.difusa[canal] * n_l
+                        + self.material.specular[canal] * luz.especular[canal] * brilho);
+            }
+        }
+        [
+            saida[0].clamp(0.0, 1.0),
+            saida[1].clamp(0.0, 1.0),
+            saida[2].clamp(0.0, 1.0),
+            difusa[3].clamp(0.0, 1.0),
+        ]
+    }
+
+    /// A conta de referência, luz por luz e vértice por vértice. Só os testes a chamam: é contra
+    /// ela que [`GlState::cor_iluminada_com`] é conferida bit a bit.
+    #[cfg(test)]
     fn cor_iluminada(
         &self,
         olho: [f32; 4],
@@ -1940,12 +2039,22 @@ impl GlState {
         let normais = matriz_de_normais(&modelview);
         let iluminando = self.lighting;
         let neblina = self.fog;
+        // O que da luz não depende do vértice sai uma vez por desenho. Ver [`LuzPronta`].
+        let luzes: Vec<LuzPronta> = match iluminando {
+            true => self.lights.iter().filter(|l| l.enabled).map(LuzPronta::de).collect(),
+            false => Vec::new(),
+        };
+        // A matriz de textura é a identidade quase sempre, e aí a conta é o próprio `uv`.
+        let textura_identidade = texture_matrix == IDENTITY;
         let mut clip = std::mem::take(&mut self.transformed);
         clip.clear();
         clip.extend(vertices.iter().map(|v| {
             // `q` é o quarto componente da coordenada de textura; a divisão por ele é o
             // que permite projeção na textura, e vale 1 no caso comum.
-            let [s, t, _, q] = transform(&texture_matrix, [v.uv[0], v.uv[1], 0.0, 1.0]);
+            let [s, t, _, q] = match textura_identidade {
+                true => [v.uv[0], v.uv[1], 0.0, 1.0],
+                false => transform(&texture_matrix, [v.uv[0], v.uv[1], 0.0, 1.0]),
+            };
             let scale = if q == 0.0 { 1.0 } else { 1.0 / q };
             // A névoa e a iluminação querem a mesma coisa: o vértice em coordenadas de olho.
             // Com uma das duas ligada a conta sai uma vez e serve às duas.
@@ -1954,7 +2063,7 @@ impl GlState {
             let color = match (iluminando, olho) {
                 (true, Some(olho)) => {
                     let normal = normaliza(gira_normal(&normais, v.normal));
-                    self.cor_iluminada(olho, normal, v.color)
+                    self.cor_iluminada_com(&luzes, olho, normal, v.color)
                 }
                 _ => v.color,
             };
@@ -2940,6 +3049,36 @@ fn normaliza(v: [f32; 3]) -> [f32; 3] {
 }
 
 /// O fator do cone de um holofote, ou um quando a luz não é holofote.
+/// O que de uma luz acesa não muda de um vértice para outro, calculado uma vez por desenho.
+struct LuzPronta {
+    ambiente: [f32; 4],
+    difusa: [f32; 4],
+    especular: [f32; 4],
+    posicao: [f32; 4],
+    /// A direção já normalizada, quando a luz é direcional (`w` zero).
+    direcao: Option<[f32; 3]>,
+    atenuacao: [f32; 3],
+    /// Eixo normalizado, cosseno do corte e expoente, quando o corte é menor que 180°.
+    holofote: Option<([f32; 3], f32, f32)>,
+}
+
+impl LuzPronta {
+    fn de(luz: &Light) -> Self {
+        Self {
+            ambiente: luz.ambient,
+            difusa: luz.diffuse,
+            especular: luz.specular,
+            posicao: luz.position,
+            direcao: (luz.position[3] == 0.0)
+                .then(|| normaliza([luz.position[0], luz.position[1], luz.position[2]])),
+            atenuacao: luz.attenuation,
+            holofote: (luz.spot_cutoff < 180.0).then(|| {
+                (normaliza(luz.spot_direction), luz.spot_cutoff.to_radians().cos(), luz.spot_exponent)
+            }),
+        }
+    }
+}
+
 fn holofote(luz: &Light, para_a_luz: [f32; 3]) -> f32 {
     if luz.spot_cutoff >= 180.0 {
         return 1.0;

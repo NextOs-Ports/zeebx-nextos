@@ -50,8 +50,15 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 CM
 export CMAKE_TOOLCHAIN_FILE_$TU="$TCFILE"
 
+# **O diretório compartilhado não separa worktrees.** O hash do crate não inclui o caminho do
+# worktree e o dep-info guarda caminhos relativos: se outro agente compilou depois da última
+# edição daqui, o cargo acha o rlib fresco e liga o código DELE neste core. Tocar as fontes
+# deste worktree (dentro da trava) força a recompilação com elas. Aviso da frente api, 25/09.
+find src frontends/libretro/src frontends/libretro/build.rs build.rs -type f -exec touch {} + 2>/dev/null || true
+MARCA=$(mktemp); trap 'rm -f "$MARCA"' EXIT
 cargo build --release --locked --target $T -p zeebx-libretro "$@"
 SO=$CARGO_TARGET_DIR/$T/release/libzeebx_libretro.so
+[ "$SO" -nt "$MARCA" ] || { echo "ERRO: o .so não foi refeito por este build; nada copiado" >&2; exit 1; }
 file "$SO" | cut -d, -f1-3
 "$TC/bin/$TRIPLO-readelf" -d "$SO" | grep -E "NEEDED|RPATH|RUNPATH" || true
 "$TC/bin/$TRIPLO-readelf" -V "$SO" | grep -oE 'GLIBC_[0-9.]+|GLIBCXX_[0-9.]+' | sort -Vu | tail -2

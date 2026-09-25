@@ -83,10 +83,17 @@ impl Contexto {
         // O shader é escrito em GLSL 3.30, então o pedido é por OpenGL 3.3 core. O GLES 3.x é a
         // queda para as placas que só oferecem o perfil embarcado — o mesmo par de tentativas que
         // o pintor da interface já faz.
-        let contexto = [
-            ContextApi::OpenGl(Some(Version::new(3, 3))),
-            ContextApi::Gles(Some(Version::new(3, 0))),
-        ]
+        // `ZEEBX_GLES=2` pede o ES 2.0 primeiro: é como os testes do `gpu.rs` passam pelo caminho
+        // do Mali (vetor do cliente, índices de 16 bits, shaders GLSL ES 1.00) numa máquina comum.
+        let so_es2 = std::env::var("ZEEBX_GLES").is_ok_and(|v| v.trim() == "2");
+        let pedidos = match so_es2 {
+            true => vec![ContextApi::Gles(Some(Version::new(2, 0)))],
+            false => vec![
+                ContextApi::OpenGl(Some(Version::new(3, 3))),
+                ContextApi::Gles(Some(Version::new(3, 0))),
+            ],
+        };
+        let contexto = pedidos
         .into_iter()
         .find_map(|api| {
             let attrs = ContextAttributesBuilder::new().with_context_api(api).build(None);

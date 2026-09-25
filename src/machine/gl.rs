@@ -44,7 +44,7 @@ impl<C: CpuBackend> Machine<C> {
             self.sync_egl_color_from_guest()?;
         }
         let base = usize::from(!legacy);
-        let a: [u32; 10] = std::array::from_fn(|i| self.arg(base + i));
+        let a = self.dez_argumentos(base);
         let this = self.arg(0);
         // As variantes `x` levam ponto fixo 16.16 e as `f`, `float` de 32 bits — mesma função,
         // só muda como o número chega.
@@ -799,6 +799,29 @@ impl<C: CpuBackend> Machine<C> {
         if self.pula_desenho && !self.gl_leitura_de_pixels {
             return Ok(());
         }
+        // **Os vértices da faixa de índices vão uma vez só, e os índices à parte.** Uma malha
+        // em `GL_TRIANGLES` indexada repete cada vértice em uns seis triângulos, e a faixa e o
+        // leque em três: antes cada repetição era lida, transformada e mandada à placa de novo.
+        // Quando a faixa `menor..=maior` não é muito maior que a lista, ela é lida inteira e o
+        // desenho vai por `draw_indexado`. O `glDrawArrays` é o caso em que a faixa é a lista.
+        if let (Some(&menor), Some(&maior)) = (indices.iter().min(), indices.iter().max()) {
+            let faixa = (maior - menor) as usize + 1;
+            if faixa <= indices.len().saturating_mul(2).max(64) {
+                let todos: Vec<u32> = (menor..=maior).collect();
+                if let Ok(vertices) = self.monta_vertices(&todos) {
+                    let locais: Vec<u32> = indices.iter().map(|&i| i - menor).collect();
+                    self.gl.draw_indexado(mode, &vertices, &locais);
+                    return Ok(());
+                }
+            }
+        }
+        let vertices = self.monta_vertices(indices)?;
+        self.gl.draw(mode, &vertices);
+        Ok(())
+    }
+
+    /// Os vértices dos índices dados, a partir dos vetores do cliente.
+    fn monta_vertices(&self, indices: &[u32]) -> Result<Vec<Vertex>, CpuError> {
         let base = self.gl.current_color();
         // Um bloco por array, não um por componente: é a mesma memória do guest, pedida de
         // uma vez. Ver [`Self::read_array`].
@@ -837,8 +860,7 @@ impl<C: CpuBackend> Machine<C> {
                 fog: 1.0,
             })
             .collect();
-        self.gl.draw(mode, &vertices);
-        Ok(())
+        Ok(vertices)
     }
 
     /// Lê os componentes de um parâmetro de luz ou material do ponteiro do jogo.
@@ -1018,6 +1040,40 @@ impl<C: CpuBackend> Machine<C> {
             };
         }
         Ok(out)
+    }
+
+    /// Os argumentos `base..base + 10` de uma chamada de GL, com as palavras da pilha lidas num
+    /// pedido só.
+    ///
+    /// **Toda chamada de GL lia dez argumentos, um por um**: seis ou sete palavras de pilha, cada
+    /// uma atravessando o empréstimo da memória e a busca da região. O `arg` era 2,3% do
+    /// processador no Quake (quadro 1800), que faz milhares de chamadas de GL por quadro. Um
+    /// `read_mem` só traz as mesmas palavras; se ele falhar (pilha colada no fim da região), cai
+    /// no caminho de uma por uma, que devolve zero para a que não dá para ler — como antes.
+    pub(super) fn dez_argumentos(&self, base: usize) -> [u32; 10] {
+        let mut a = [0u32; 10];
+        let mut i = 0;
+        while i < 10 && base + i < 4 {
+            a[i] = self.arg(base + i);
+            i += 1;
+        }
+        let primeira = base + i - 4;
+        let mut bytes = [0u8; 40];
+        let quantos = 10 - i;
+        let sp = self.cpu.read_reg(Reg::Sp);
+        match self.cpu.read_mem(sp + primeira as u32 * 4, &mut bytes[..quantos * 4]) {
+            Ok(()) => {
+                for (k, palavra) in bytes[..quantos * 4].chunks_exact(4).enumerate() {
+                    a[i + k] = u32::from_le_bytes([palavra[0], palavra[1], palavra[2], palavra[3]]);
+                }
+            }
+            Err(_) => {
+                for k in i..10 {
+                    a[k] = self.arg(base + k);
+                }
+            }
+        }
+        a
     }
 
     /// N-ésimo argumento da AAPCS: `r0..r3` e, daí em diante, palavras da pilha.
