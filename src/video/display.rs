@@ -85,6 +85,18 @@ pub struct Framebuffer {
 /// De onde sai a [`Framebuffer::versao`] de cada superfície nova.
 static PROXIMA_SERIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Quantas vezes alguma superfície ganhou caixa suja, somando todas.
+static SUJAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Muda sempre que alguma superfície foi escrita ou criada: com o mesmo valor de antes, nenhuma
+/// caixa suja nova nem superfície nova existe desde então.
+pub fn carimbo_das_superficies() -> (u64, u64) {
+    (
+        SUJAS.load(std::sync::atomic::Ordering::Relaxed),
+        PROXIMA_SERIE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 impl Framebuffer {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
@@ -141,6 +153,21 @@ impl Framebuffer {
         self.touched = touched;
         self.serie = serie;
         self.sujo = sujo;
+        SUJAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Os pixels de `inicio` até `fim` como bytes RGB565 little-endian, **sem copiar** quando o
+    /// host é little-endian (é o caso de todo aparelho que roda o core).
+    pub fn rgb565_fatia(&self, inicio: usize, fim: usize) -> std::borrow::Cow<'_, [u8]> {
+        let pixels = &self.pixels[inicio..fim];
+        if cfg!(target_endian = "little") {
+            // SAFETY: `u16` sem enchimento, alinhamento de `u8` é 1, e o tamanho é o dobro.
+            std::borrow::Cow::Borrowed(unsafe {
+                std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 2)
+            })
+        } else {
+            std::borrow::Cow::Owned(self.rgb565_intervalo(inicio, fim))
+        }
     }
 
     /// Os pixels de `inicio` até `fim` (índices de pixel, fim exclusivo), em bytes RGB565.
@@ -156,6 +183,7 @@ impl Framebuffer {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        SUJAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.sujo = Some(match self.sujo {
             None => [x0, y0, x1, y1],
             Some([a, b, c, d]) => [a.min(x0), b.min(y0), c.max(x1), d.max(y1)],

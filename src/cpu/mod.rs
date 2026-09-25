@@ -116,6 +116,22 @@ pub trait CpuBackend {
     /// custando um hook em toda escrita do guest naquele endereço.
     fn unwatch_dirty(&mut self, _id: u32) {}
 
+    /// Um número que sobe sempre que alguma faixa vigiada passa de limpa a suja. `None` quando o
+    /// backend não sabe dizer — aí quem pergunta tem de conferir faixa por faixa.
+    fn geracao_das_vigias(&self) -> Option<u64> {
+        None
+    }
+
+    /// Se alguma faixa vigiada está suja agora. Na dúvida, sim.
+    fn alguma_vigia_suja(&self) -> bool {
+        true
+    }
+
+    /// Se há faixa armada com este `id`. Sem faixa, `take_dirty` responde sempre sujo.
+    fn vigiada(&self, _id: u32) -> bool {
+        false
+    }
+
     /// Lê **e limpa** o sinalizador de `id`. `true` quando o guest pode ter escrito desde a
     /// última vez, e também quando não há faixa armada com esse `id` — na dúvida, sujo.
     fn take_dirty(&mut self, _id: u32) -> bool {

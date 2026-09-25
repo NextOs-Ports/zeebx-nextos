@@ -1,4 +1,16 @@
 //! IBitmap e o DIB: as superfícies, o blit e a sincronia com a memória do jogo.
+/// Contadores de `ZEEBX_MEDE` para a sincronização de superfícies com o guest.
+pub mod conta {
+    use std::sync::atomic::AtomicU64;
+    pub static SYNC: AtomicU64 = AtomicU64::new(0);
+    pub static DIBS: AtomicU64 = AtomicU64::new(0);
+    pub static LEITURAS: AtomicU64 = AtomicU64::new(0);
+    pub static ESCRITAS_INTEIRAS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static PARCIAIS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES_PARCIAIS: AtomicU64 = AtomicU64::new(0);
+}
+
 
 use super::*;
 
@@ -276,6 +288,7 @@ impl<C: CpuBackend> Machine<C> {
 
         self.bitmaps.insert(target, Framebuffer::new(cx, cy));
         self.dib_buffers.insert(target, buffer);
+        self.dib_mudancas += 1;
         // Aqui o buffer é do próprio jogo, e é dele que os pixels vêm.
         self.dib_herdados.remove(&target);
         self.cpu.watch_dirty(target, buffer, pitch as u32 * cy)?;
@@ -856,11 +869,13 @@ impl<C: CpuBackend> Machine<C> {
             let Some((buffer, capacidade)) = self.reserva_superficie(precisa) else {
                 self.dib_buffers.remove(&bitmap);
                 self.dib_capacity.remove(&bitmap);
+                self.dib_mudancas += 1;
                 return Ok(());
             };
             self.dib_buffers.insert(bitmap, buffer);
             self.dib_capacity.insert(bitmap, capacidade);
             self.dib_publicado.remove(&bitmap);
+            self.dib_mudancas += 1;
             self.cpu.watch_dirty(bitmap, buffer, precisa)?;
             // A primeira exposição precisa publicar os pixels atuais. Exposições seguintes
             // apenas atualizam o cabeçalho: reescrever a superfície inteira em cada
@@ -934,6 +949,7 @@ impl<C: CpuBackend> Machine<C> {
         }
         self.dib_herdados.remove(&bitmap);
         self.dib_publicado.remove(&bitmap);
+        self.dib_mudancas += 1;
         self.cpu.unwatch_dirty(bitmap);
     }
 
@@ -984,23 +1000,33 @@ impl<C: CpuBackend> Machine<C> {
             };
             let largura = fb.width() as usize;
             let passo = fb.passo_do_dib();
-            if passo == largura * 2 {
+            // **Faixa contígua só quando a caixa é larga.** Para um sprite, a faixa contígua
+            // levava as linhas inteiras entre a primeira e a última: um sprite de 32 linhas numa
+            // tela de 640 escrevia 40 KB em vez de 2 KB. No Pac-Mania eram 16 MB por quadro.
+            let estreita = ((x1 - x0) as usize) * 2 < largura;
+            if passo == largura * 2 && !estreita {
                 let inicio = y0 as usize * largura + x0 as usize;
                 let fim = (y1 as usize - 1) * largura + x1 as usize;
-                let bytes = fb.rgb565_intervalo(inicio, fim);
+                let bytes = fb.rgb565_fatia(inicio, fim);
+                conta::PARCIAIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.cpu.write_mem(buffer + inicio as u32 * 2, &bytes)?;
             } else {
-                // Com enchimento no fim da linha, a faixa contígua não bate com o buffer: vai
-                // linha a linha.
+                // Linha a linha: caixa estreita, ou enchimento no fim da linha, que faz a faixa
+                // contígua não bater com o buffer.
                 for linha in y0 as usize..y1 as usize {
                     let inicio = linha * largura + x0 as usize;
-                    let bytes = fb.rgb565_intervalo(inicio, linha * largura + x1 as usize);
+                    let bytes = fb.rgb565_fatia(inicio, linha * largura + x1 as usize);
+                    conta::PARCIAIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     let destino = linha * passo + x0 as usize * 2;
                     self.cpu.write_mem(buffer + destino as u32, &bytes)?;
                 }
             }
         } else {
             let bytes = fb.to_dib_bytes();
+            conta::ESCRITAS_INTEIRAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            conta::BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             self.cpu.write_mem(buffer, &bytes)?;
         }
         self.dib_herdados.remove(&bitmap);
@@ -1045,6 +1071,8 @@ impl<C: CpuBackend> Machine<C> {
         if !self.cpu.take_dirty(bitmap) {
             return Ok(());
         }
+        conta::LEITURAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        conta::BYTES.fetch_add(tamanho as u64, std::sync::atomic::Ordering::Relaxed);
         let mut bytes = vec![0u8; tamanho];
         self.cpu.read_mem(buffer, &mut bytes)?;
         if let Some(fb) = self.bitmaps.get_mut(&bitmap) {
@@ -1062,16 +1090,43 @@ impl<C: CpuBackend> Machine<C> {
     /// Chamado só nas interfaces que mexem em pixels: um jogo faz dezenas de milhares de
     /// chamadas de outras APIs, e copiar 600 KB em cada uma seria inviável.
     pub(super) fn sync_surfaces_in(&mut self) -> Result<(), CpuError> {
+        conta::SYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        conta::DIBS.store(self.dib_buffers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        // **Nada mudou, nada a fazer.** O Pac-Mania chama isto 2.800 vezes por quadro, e cada
+        // passada percorria as 49 superfícies dele sem copiar nada. Pular exige as três coisas:
+        // a última passada acabou com toda vigia limpa, nenhuma ficou suja desde então (geração
+        // igual) e os mapas de DIB não mudaram. Um backend sem geração nunca pula.
+        let geracao = self.cpu.geracao_das_vigias();
+        if let Some(g) = geracao
+            && self.dib_entrada_limpa == Some((g, self.dib_mudancas))
+        {
+            return Ok(());
+        }
         for bitmap in self.dib_buffers.keys().copied().collect::<Vec<_>>() {
             self.sync_from_guest(bitmap)?;
         }
+        let todas_vigiadas = self.dib_buffers.keys().all(|b| self.cpu.vigiada(*b));
+        self.dib_entrada_limpa = match (self.cpu.geracao_das_vigias(), todas_vigiadas) {
+            (Some(g), true) if !self.cpu.alguma_vigia_suja() => Some((g, self.dib_mudancas)),
+            _ => None,
+        };
         Ok(())
     }
 
     pub(super) fn sync_surfaces_out(&mut self) -> Result<(), CpuError> {
+        // Mesma ideia do lado de lá: sem superfície escrita ou criada e sem mudança nos mapas de
+        // DIB desde a última passada completa, todas continuam publicadas.
+        let carimbo = (crate::video::display::carimbo_das_superficies(), self.dib_mudancas);
+        if self.dib_saida_limpa == Some(carimbo) {
+            return Ok(());
+        }
         for bitmap in self.dib_buffers.keys().copied().collect::<Vec<_>>() {
             self.sync_to_guest(bitmap)?;
         }
+        self.dib_saida_limpa = Some((
+            crate::video::display::carimbo_das_superficies(),
+            self.dib_mudancas,
+        ));
         Ok(())
     }
 

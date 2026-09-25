@@ -72,6 +72,9 @@ soundfont = ["dep:rustysynth"]
 gpu = ["gl", "dep:glutin", "dep:raw-window-handle"]
 # O binário é a interface desktop: sem a feature ele nem é construído.
 [dependencies]
+# Hash rápido para os mapas de chave inteira do caminho quente (objetos e superfícies): o SipHash
+# padrão era ~20% do processador num jogo 2D no Mali-450.
+rustc-hash = "2.1.3"
 # Tipos de interface compartilhados pelo desktop e pelo frontend Android; não abre janela sozinho.
 egui = { version = "0.33.3", default-features = false, features = ["default_fonts"] }
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }

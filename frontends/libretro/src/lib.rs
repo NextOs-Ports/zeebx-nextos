@@ -2359,6 +2359,22 @@ fn relata_medicao(duracao: std::time::Duration) {
         zeebx::cpu::dynarmic::conta::DOBRAS.swap(0, Relaxed),
         zeebx::cpu::dynarmic::conta::LIMPEZAS.swap(0, Relaxed),
     ));
+    {
+        use zeebx::machine::bitmap_conta as b;
+        log(&format!(
+            "Zeebx MEDE 2d: {:.0} sincronizações/q | {} superfícies | {:.1} leituras/q | {:.1} escritas inteiras/q | {:.0} KB/q",
+            b::SYNC.swap(0, Relaxed) as f64 / q,
+            b::DIBS.load(Relaxed),
+            b::LEITURAS.swap(0, Relaxed) as f64 / q,
+            b::ESCRITAS_INTEIRAS.swap(0, Relaxed) as f64 / q,
+            b::BYTES.swap(0, Relaxed) as f64 / q / 1024.0,
+        ));
+        log(&format!(
+            "Zeebx MEDE 2d parciais: {:.0} escritas/q, {:.0} KB/q",
+            b::PARCIAIS.swap(0, Relaxed) as f64 / q,
+            b::BYTES_PARCIAIS.swap(0, Relaxed) as f64 / q / 1024.0,
+        ));
+    }
     log(&format!(
         "Zeebx MEDE: {:.1} fps | run {:.2} ms/q | submete {:.2} ms/q ({:.0} draws, {:.0} vert) | leitura {:.2} ms/q ({:.1}/q) | textura {:.2} ms/q ({:.1}/q)",
         parede.map_or(0.0, |p| q / p),

@@ -32,9 +32,9 @@ pub struct ObjectStore {
     /// respeita.
     livres: Vec<u32>,
     /// Interface de cada objeto vivo, indexada pelo ponteiro no guest.
-    kinds: HashMap<u32, Interface>,
+    kinds: rustc_hash::FxHashMap<u32, Interface>,
     /// Contagem de referências, para responder `AddRef`/`Release` com honestidade.
-    refs: HashMap<u32, u32>,
+    refs: rustc_hash::FxHashMap<u32, u32>,
 }
 
 impl ObjectStore {
@@ -48,8 +48,8 @@ impl ObjectStore {
             end: base + size as u32,
             next: base,
             livres: Vec::new(),
-            kinds: HashMap::new(),
-            refs: HashMap::new(),
+            kinds: Default::default(),
+            refs: Default::default(),
         }
     }
 
@@ -205,7 +205,7 @@ impl crate::save_state::Guardavel for ObjectStore {
 
         self.next = next;
         self.livres = livres;
-        self.kinds = kinds;
+        self.kinds = kinds.into_iter().collect();
         self.refs = refs.into_iter().collect();
         Ok(())
     }

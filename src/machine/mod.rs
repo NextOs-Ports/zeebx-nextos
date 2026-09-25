@@ -28,6 +28,7 @@ use crate::video::rasterizer::{self, GlState, Rasterizador, Vertex};
 
 mod save;
 mod bitmap;
+pub use bitmap::conta as bitmap_conta;
 mod cifra;
 mod diagnostico;
 mod display;
@@ -2312,7 +2313,7 @@ pub struct Machine<C: CpuBackend> {
     /// Onde cada linha está em `debug_output`, para agrupar sem varrer a lista a cada chamada.
     debug_indice: HashMap<String, usize>,
     /// Superfícies de desenho, indexadas pelo ponteiro do `IBitmap` no guest.
-    bitmaps: HashMap<u32, Framebuffer>,
+    bitmaps: rustc_hash::FxHashMap<u32, Framebuffer>,
     /// `r0..r11` no momento da última falha de memória, para o relatório.
     fault_regs: [u32; 12],
     /// Endereços de retorno vistos na pilha da última falha.
@@ -2575,7 +2576,7 @@ pub struct Machine<C: CpuBackend> {
     /// reentrância, não concorrência.
     current_thread: Option<u32>,
     /// Buffer de pixels no guest de cada superfície exposta como `IDIB`.
-    dib_buffers: HashMap<u32, u32>,
+    dib_buffers: rustc_hash::FxHashMap<u32, u32>,
     /// Quantos bytes o buffer publicado de cada `IDIB` tem.
     ///
     /// Existe porque o endereço de um objeto **volta a ser usado**: liberado o anterior, o
@@ -2594,7 +2595,7 @@ pub struct Machine<C: CpuBackend> {
     /// seguro se o buffer nunca estiver atrás do host — e aqui estava: as letras do Tekken 2 e
     /// do Kingdom Hearts viravam blocos, com a folha de glifos substituída pela imagem
     /// decodificada antes dela.
-    dib_herdados: HashSet<u32>,
+    dib_herdados: rustc_hash::FxHashSet<u32>,
     /// Bitmaps do decodificador de PNG cujo `IDIB` mostra os pixels no formato do próprio PNG
     /// (RGB de 24 bits ou RGBA de 32), e não em RGB565: o buffer e a capacidade dele. Ficam fora
     /// da sincronização — a nossa cópia em RGB565 serve aos blits, e o buffer é só leitura para o
@@ -2606,7 +2607,15 @@ pub struct Machine<C: CpuBackend> {
     /// Sem isto, **toda** chamada que desenha reescrevia todas as superfícies expostas inteiras
     /// na memória do jogo, mudadas ou não. O Pac-Mania faz 168 mil `IIMAGE_Draw` em cinco
     /// segundos virtuais: 95% do tempo de API — 30 segundos de relógio — era essa cópia.
-    dib_publicado: HashMap<u32, u64>,
+    dib_publicado: rustc_hash::FxHashMap<u32, u64>,
+    /// Sobe a cada mudança nos mapas de DIB fora das próprias sincronizações. Ver
+    /// `sync_surfaces_in`/`sync_surfaces_out`.
+    dib_mudancas: u64,
+    /// Carimbo da última passada completa de entrada que terminou com tudo limpo: (geração das
+    /// vigias, `dib_mudancas`). Igual de novo, a passada não teria o que fazer.
+    dib_entrada_limpa: Option<(u64, u64)>,
+    /// Carimbo da última passada completa de saída: (carimbo das superfícies, `dib_mudancas`).
+    dib_saida_limpa: Option<((u64, u64), u64)>,
     /// A região de superfícies, com o mesmo alocador do heap do jogo. Ver
     /// [`Machine::reserva_superficie`].
     superficies: Heap,
@@ -2949,7 +2958,7 @@ impl<C: CpuBackend> Machine<C> {
             trace_filter: None,
             debug_output: Vec::new(),
             debug_indice: HashMap::new(),
-            bitmaps: HashMap::new(),
+            bitmaps: Default::default(),
             fault_regs: [0; 12],
             fault_stack: Vec::new(),
             timers: Vec::new(),
@@ -3068,11 +3077,14 @@ impl<C: CpuBackend> Machine<C> {
             pending_threads: Vec::new(),
             stalled: None,
             current_thread: None,
-            dib_buffers: HashMap::new(),
+            dib_buffers: Default::default(),
             dib_capacity: HashMap::new(),
-            dib_herdados: HashSet::new(),
+            dib_herdados: Default::default(),
             dib_do_decodificador: HashMap::new(),
-            dib_publicado: HashMap::new(),
+            dib_publicado: Default::default(),
+            dib_mudancas: 0,
+            dib_entrada_limpa: None,
+            dib_saida_limpa: None,
             superficies: Heap::new(loader::SURFACE_BASE, loader::SURFACE_SIZE),
             widgets_avisando: std::collections::HashSet::new(),
             transparency: HashMap::new(),
@@ -3867,6 +3879,7 @@ impl<C: CpuBackend> Machine<C> {
         };
         if self.dib_buffers.contains_key(&addr) {
             self.dib_herdados.insert(addr);
+            self.dib_mudancas += 1;
         }
         // A cor transparente é do bitmap que morreu aqui, não do objeto que nasce.
         self.transparency.remove(&addr);

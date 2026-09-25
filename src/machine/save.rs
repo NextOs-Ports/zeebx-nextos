@@ -542,7 +542,8 @@ impl<C: CpuBackend> Machine<C> {
         }
 
         // Aplicação.
-        self.dib_buffers = dib_buffers;
+        self.dib_buffers = dib_buffers.into_iter().collect();
+        self.dib_mudancas += 1;
         self.dib_capacity = dib_capacity;
         self.transformacoes = transformacoes;
         self.canvases = canvases;
@@ -556,28 +557,27 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     fn tabelas_numericas(&self) -> Vec<(&'static str, Vec<u32>)> {
-        let mapa = |m: &std::collections::HashMap<u32, u32>| -> Vec<u32> {
-            let mut pares: Vec<(u32, u32)> = m.iter().map(|(a, b)| (*a, *b)).collect();
+        let mapa = |m: &dyn Fn() -> Vec<(u32, u32)>| -> Vec<u32> {
+            let mut pares: Vec<(u32, u32)> = m();
             pares.sort_unstable();
             pares.into_iter().flat_map(|(a, b)| [a, b]).collect()
         };
         vec![
-            ("tab.dib_buffers", mapa(&self.dib_buffers)),
-            ("tab.dib_capacity", mapa(&self.dib_capacity)),
-            ("tab.transformacoes", mapa(&self.transformacoes)),
-            ("tab.canvases", mapa(&self.canvases)),
-            ("tab.feeds", mapa(&self.feeds)),
-            ("tab.image_bitmaps", mapa(&self.image_bitmaps)),
-            ("tab.image_info", mapa(&self.image_info)),
+            ("tab.dib_buffers", mapa(&|| self.dib_buffers.iter().map(|(a, b)| (*a, *b)).collect())),
+            ("tab.dib_capacity", mapa(&|| self.dib_capacity.iter().map(|(a, b)| (*a, *b)).collect())),
+            ("tab.transformacoes", mapa(&|| self.transformacoes.iter().map(|(a, b)| (*a, *b)).collect())),
+            ("tab.canvases", mapa(&|| self.canvases.iter().map(|(a, b)| (*a, *b)).collect())),
+            ("tab.feeds", mapa(&|| self.feeds.iter().map(|(a, b)| (*a, *b)).collect())),
+            ("tab.image_bitmaps", mapa(&|| self.image_bitmaps.iter().map(|(a, b)| (*a, *b)).collect())),
+            ("tab.image_info", mapa(&|| self.image_info.iter().map(|(a, b)| (*a, *b)).collect())),
             (
                 "tab.transparency",
-                mapa(
-                    &self
-                        .transparency
+                mapa(&|| {
+                    self.transparency
                         .iter()
                         .map(|(a, v)| (*a, u32::from(*v)))
-                        .collect(),
-                ),
+                        .collect()
+                }),
             ),
             // Onde ficava a leitura de cada stream de memória: são quatro números por objeto.
             (
@@ -1007,7 +1007,7 @@ impl<C: CpuBackend> Machine<C> {
             );
         }
 
-        self.bitmaps = superficies;
+        self.bitmaps = superficies.into_iter().collect();
         self.screen = tela;
         self.images = imagens;
         Ok(())
@@ -1389,7 +1389,8 @@ impl<C: CpuBackend> Machine<C> {
         self.orcamento = orcamento;
         self.proximo_serial = proximo_serial;
         self.installed_applets = installed_applets;
-        self.dib_herdados = dib_herdados;
+        self.dib_herdados = dib_herdados.into_iter().collect();
+        self.dib_mudancas += 1;
         self.widgets_avisando = widgets_avisando;
         self.mif_no_guest = mif_no_guest;
         self.ext_modules = ext_modules;
@@ -1397,7 +1398,7 @@ impl<C: CpuBackend> Machine<C> {
         self.rolagem_maxima_html = rolagem_maxima_html;
         self.image_notify = image_notify;
         self.dib_do_decodificador = dib_do_decodificador;
-        self.dib_publicado = dib_publicado;
+        self.dib_publicado = dib_publicado.into_iter().collect();
         self.vetores = vetores;
         self.collections = collections;
         Ok(())

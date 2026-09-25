@@ -156,6 +156,8 @@ struct Estado {
     constantes: RefCell<std::collections::HashMap<u32, u64>>,
     escritas: RefCell<std::collections::HashMap<u32, u64>>,
     limpa_tudo: Cell<bool>,
+    /// Ver [`CpuBackend::geracao_das_vigias`].
+    geracao: Cell<u64>,
     /// As faixas de [`CpuBackend::watch_dirty`]: `(id, início, fim, sujo)`.
     vigias: RefCell<Vec<(u32, u32, u32, bool)>>,
     /// O menor intervalo que contém todas as vigias. Quase toda escrita do guest cai fora dele,
@@ -232,6 +234,9 @@ impl Estado {
         let mut faixa = (0, 0);
         for vigia in vigias.iter_mut() {
             if inicio < vigia.2 && fim > vigia.1 {
+                if !vigia.3 {
+                    self.geracao.set(self.geracao.get() + 1);
+                }
                 vigia.3 = true;
                 tocadas += 1;
                 faixa = (vigia.1, vigia.2);
@@ -550,6 +555,7 @@ impl CpuBackend for DynarmicCpu {
             constantes: Default::default(),
             escritas: Default::default(),
             limpa_tudo: Cell::new(false),
+            geracao: Cell::new(0),
             vigias: Default::default(),
             envoltorio: Cell::new((0, 0)),
             atalho: Cell::new((0, 0)),
@@ -619,6 +625,7 @@ impl CpuBackend for DynarmicCpu {
         jit.vigias
             .borrow_mut()
             .push((id, base, base.saturating_add(len), true));
+        jit.geracao.set(jit.geracao.get() + 1);
         jit.recalcula_envoltorio();
         // Escrita em faixa vigiada tem de passar pela callback que a marca suja.
         let fim = base.saturating_add(len);
@@ -645,6 +652,18 @@ impl CpuBackend for DynarmicCpu {
         }
     }
 
+    fn geracao_das_vigias(&self) -> Option<u64> {
+        self.jit().ok().map(|jit| jit.geracao.get())
+    }
+
+    fn alguma_vigia_suja(&self) -> bool {
+        self.jit().map_or(true, |jit| jit.vigias.borrow().iter().any(|v| v.3))
+    }
+
+    fn vigiada(&self, id: u32) -> bool {
+        self.jit().is_ok_and(|jit| jit.vigias.borrow().iter().any(|v| v.0 == id))
+    }
+
     fn take_dirty(&mut self, id: u32) -> bool {
         let Ok(jit) = self.jit_mut() else {
             return true;
@@ -665,6 +684,9 @@ impl CpuBackend for DynarmicCpu {
         let fim = addr.saturating_add(len);
         for vigia in jit.vigias.borrow_mut().iter_mut() {
             if addr < vigia.2 && fim > vigia.1 {
+                if !vigia.3 {
+                    jit.geracao.set(jit.geracao.get() + 1);
+                }
                 vigia.3 = true;
             }
         }

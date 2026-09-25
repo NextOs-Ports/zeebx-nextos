@@ -910,7 +910,19 @@ impl<C: CpuBackend> Machine<C> {
 
     /// Enfileira o aviso de fim dos sons que já terminaram.
     pub(super) fn poll_media(&mut self) -> Result<(), CpuError> {
+        // Roda em toda chamada de API: quase sempre nada terminou, e a pergunta não pode custar
+        // uma alocação (5,9% do processador no Pac-Mania no Mali-450).
+        if self.media.is_empty() {
+            return Ok(());
+        }
         let now = self.now_us();
+        if !self
+            .media
+            .values()
+            .any(|state| state.state == MM_STATE_PLAY && now >= state.ends_us)
+        {
+            return Ok(());
+        }
         let finished: Vec<u32> = self
             .media
             .iter()
