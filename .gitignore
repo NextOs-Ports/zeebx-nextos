@@ -51,3 +51,4 @@ frontends/android/apk/app/src/main/jniLibs/
 /nextos/out/
 /nextos/build-*.log
 /nextos/toolchain.cmake
+/nextos/prof-*.txt
