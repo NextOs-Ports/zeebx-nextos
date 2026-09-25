@@ -2310,9 +2310,52 @@ fn troca_para(estado: &mut Core, caminho: &Path, aberto_pela_z_wheel: bool) -> R
 pub extern "C" fn retro_run() {
     let inicio = zeebx::video::gpu::mede::agora();
     retro_run_dentro();
-    if let Some(inicio) = inicio {
-        relata_medicao(inicio.elapsed());
+    if let Some(inicio) = inicio
+        && let Some(quadros) = relata_medicao(inicio.elapsed())
+    {
+        relata_chamadas(quadros);
     }
+}
+
+/// A linha `Zeebx MEDE api` do relatório: chamadas de API por quadro e as que mais se repetem.
+///
+/// Cada chamada sai do JIT e volta (ver `Machine::execute`), então o número por quadro é o que
+/// multiplica o custo fixo de uma ida e volta. A contagem vem do mapa que o motor já mantém para o
+/// relatório de APIs; aqui só se tira a diferença para a amostra anterior.
+fn relata_chamadas(quadros: u64) {
+    static ANTES: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+    let agora: std::collections::HashMap<String, u64> = {
+        let Ok(guard) = core().lock() else {
+            return;
+        };
+        let Some(EstadoDoCore(estado)) = guard.as_ref() else {
+            return;
+        };
+        estado.session.chamadas_de_api().into_iter().collect()
+    };
+    let Ok(mut antes) = ANTES.lock() else {
+        return;
+    };
+    let anterior = antes.take().unwrap_or_default();
+    let mut deltas: Vec<(&String, u64)> = agora
+        .iter()
+        .map(|(nome, &n)| (nome, n.saturating_sub(anterior.get(nome).copied().unwrap_or(0))))
+        .filter(|&(_, d)| d > 0)
+        .collect();
+    deltas.sort_unstable_by_key(|&(_, d)| std::cmp::Reverse(d));
+    let total: u64 = deltas.iter().map(|&(_, d)| d).sum();
+    let q = quadros as f64;
+    let topo: Vec<String> = deltas
+        .iter()
+        .take(8)
+        .map(|(nome, d)| format!("{nome} {:.0}", *d as f64 / q))
+        .collect();
+    log(&format!(
+        "Zeebx MEDE api: {:.0} chamadas/q | {}",
+        total as f64 / q,
+        topo.join(" | ")
+    ));
+    *antes = Some(agora);
 }
 
 unsafe extern "C" {
@@ -2323,7 +2366,7 @@ static NS_VIDEO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 /// O relatório de `ZEEBX_MEDE=1`: a cada 120 quadros, quanto tempo o `retro_run` levou e quanto
 /// disso foi envio de lotes, leitura do quadro e textura, com os desenhos por quadro.
-fn relata_medicao(duracao: std::time::Duration) {
+fn relata_medicao(duracao: std::time::Duration) -> Option<u64> {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static QUADROS: AtomicU64 = AtomicU64::new(0);
     static NS_RUN: AtomicU64 = AtomicU64::new(0);
@@ -2331,7 +2374,7 @@ fn relata_medicao(duracao: std::time::Duration) {
     NS_RUN.fetch_add(duracao.as_nanos() as u64, Relaxed);
     let n = QUADROS.fetch_add(1, Relaxed) + 1;
     if n < 120 {
-        return;
+        return None;
     }
     QUADROS.store(0, Relaxed);
     let run_ms = NS_RUN.swap(0, Relaxed) as f64 / 1e6;
@@ -2387,6 +2430,7 @@ fn relata_medicao(duracao: std::time::Duration) {
         ms_tex / q,
         texs as f64 / q,
     ));
+    Some(n)
 }
 
 fn retro_run_dentro() {

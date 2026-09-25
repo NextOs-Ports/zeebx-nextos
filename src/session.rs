@@ -1212,6 +1212,14 @@ pub const SPLASH_DA_Z_WHEEL: &str = "zeebosplash.rgb565.raw";
 ///
 /// O [`Session::log`] monta texto para a janela; o levantamento precisa das listas cruas e do
 /// desfecho como enum, para classificar e comparar com o que já se sabia do jogo. Só o teste
+impl Session {
+    /// Quantas vezes cada método de API foi chamado desde o começo da sessão. É o que o
+    /// relatório `ZEEBX_MEDE` do core diferencia a cada 120 quadros para dizer quais APIs pesam.
+    pub fn chamadas_de_api(&self) -> Vec<(String, u64)> {
+        self.machine.call_log()
+    }
+}
+
 /// usa isto, e por isso não faz parte da interface da sessão.
 #[cfg(test)]
 impl Session {
