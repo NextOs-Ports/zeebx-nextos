@@ -65,16 +65,24 @@ __attribute__((constructor)) static void zeebx_prof_init(void) {
     zeebx_prof_on = 1;
 }
 
+/* ZEEBX_PROF_DESDE=R: o arquivo só leva as amostras depois do R-ésimo relatório (R*120 quadros).
+ * Sem isto a carga do jogo (JIT compilando, blake3, descompressão) entra no perfil do quadro: no
+ * NFS a 1800 quadros ela era 20% das amostras. */
+static unsigned zeebx_prof_marca, zeebx_prof_relatorios;
+
 void zeebx_prof_dump(void) {
     if (!zeebx_prof_on)
         return;
     unsigned n = zeebx_prof_n;
     if (n > ZEEBX_PROF_MAX)
         n = ZEEBX_PROF_MAX;
+    const char *desde = getenv("ZEEBX_PROF_DESDE");
+    if (desde && ++zeebx_prof_relatorios == (unsigned)atoi(desde))
+        zeebx_prof_marca = n;
     FILE *f = fopen("/tmp/zeebx-prof.txt.tmp", "w");
     if (!f)
         return;
-    for (unsigned i = 0; i < n; i++) {
+    for (unsigned i = zeebx_prof_marca; i < n; i++) {
         for (int k = 0; k < ZEEBX_PROF_PROF; k++) {
             Dl_info d;
             unsigned long pc = zeebx_prof_pcs[i][k];
