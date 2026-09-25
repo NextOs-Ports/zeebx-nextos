@@ -2613,6 +2613,11 @@ pub struct Machine<C: CpuBackend> {
     /// Sobe a cada mudança nos mapas de DIB fora das próprias sincronizações. Ver
     /// `sync_surfaces_in`/`sync_surfaces_out`.
     dib_mudancas: u64,
+    /// Superfícies em modo cópia: fora da vigia (escrita do jogo sem callback) e comparadas com
+    /// esta cópia do buffer na hora de sincronizar. Ver `sync_from_guest`.
+    dib_copia: rustc_hash::FxHashMap<u32, Vec<u8>>,
+    /// Quantas comparações seguidas uma superfície em modo cópia passou sem mudar.
+    dib_iguais: rustc_hash::FxHashMap<u32, u32>,
     /// Carimbo da última passada completa de entrada que terminou com tudo limpo: (geração das
     /// vigias, `dib_mudancas`). Igual de novo, a passada não teria o que fazer.
     dib_entrada_limpa: Option<(u64, u64)>,
@@ -3086,6 +3091,8 @@ impl<C: CpuBackend> Machine<C> {
             dib_do_decodificador: HashMap::new(),
             dib_publicado: Default::default(),
             dib_mudancas: 0,
+            dib_copia: Default::default(),
+            dib_iguais: Default::default(),
             dib_entrada_limpa: None,
             dib_saida_limpa: None,
             superficies: Heap::new(loader::SURFACE_BASE, loader::SURFACE_SIZE),

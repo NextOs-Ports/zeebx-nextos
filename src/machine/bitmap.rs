@@ -1,4 +1,10 @@
 //! IBitmap e o DIB: as superfícies, o blit e a sincronia com a memória do jogo.
+/// Escritas do jogo numa superfície vigiada, entre duas sincronizações, a partir das quais ela
+/// passa ao modo cópia. Ver `sync_from_guest`.
+const TOQUES_PARA_COPIA: u64 = 16_384;
+/// Comparações seguidas sem mudança para uma superfície em modo cópia voltar a ser vigiada.
+const IGUAIS_PARA_VIGIAR: u32 = 64;
+
 /// Contadores de `ZEEBX_MEDE` para a sincronização de superfícies com o guest.
 pub mod conta {
     use std::sync::atomic::AtomicU64;
@@ -289,6 +295,8 @@ impl<C: CpuBackend> Machine<C> {
         self.bitmaps.insert(target, Framebuffer::new(cx, cy));
         self.dib_buffers.insert(target, buffer);
         self.dib_mudancas += 1;
+        self.dib_copia.remove(&target);
+        self.dib_iguais.remove(&target);
         // Aqui o buffer é do próprio jogo, e é dele que os pixels vêm.
         self.dib_herdados.remove(&target);
         self.cpu.watch_dirty(target, buffer, pitch as u32 * cy)?;
@@ -876,6 +884,8 @@ impl<C: CpuBackend> Machine<C> {
             self.dib_capacity.insert(bitmap, capacidade);
             self.dib_publicado.remove(&bitmap);
             self.dib_mudancas += 1;
+            self.dib_copia.remove(&bitmap);
+            self.dib_iguais.remove(&bitmap);
             self.cpu.watch_dirty(bitmap, buffer, precisa)?;
             // A primeira exposição precisa publicar os pixels atuais. Exposições seguintes
             // apenas atualizam o cabeçalho: reescrever a superfície inteira em cada
@@ -950,6 +960,8 @@ impl<C: CpuBackend> Machine<C> {
         self.dib_herdados.remove(&bitmap);
         self.dib_publicado.remove(&bitmap);
         self.dib_mudancas += 1;
+        self.dib_copia.remove(&bitmap);
+        self.dib_iguais.remove(&bitmap);
         self.cpu.unwatch_dirty(bitmap);
     }
 
@@ -1043,6 +1055,13 @@ impl<C: CpuBackend> Machine<C> {
         }
         self.dib_herdados.remove(&bitmap);
         self.dib_publicado.insert(bitmap, serie);
+        // O que o host acabou de escrever não é mudança do jogo: a cópia acompanha.
+        if self.dib_copia.contains_key(&bitmap) {
+            let tamanho = self.bitmaps.get(&bitmap).map_or(0, |fb| fb.passo_do_dib() * fb.height() as usize);
+            let mut atual = vec![0u8; tamanho];
+            self.cpu.read_mem(buffer, &mut atual)?;
+            self.dib_copia.insert(bitmap, atual);
+        }
         // A superfície do guest acabou de ficar **idêntica** à nossa — e foi a escrita acima que
         // ligou o sinalizador. Limpar aqui é o que permite pular a importação seguinte: sem
         // isto toda saída sujaria tudo de novo e a vigia não economizaria nada.
@@ -1077,6 +1096,34 @@ impl<C: CpuBackend> Machine<C> {
         if self.dib_herdados.contains(&bitmap) {
             return Ok(());
         }
+        // **Modo cópia**: a superfície está fora da vigia, e mudou se o buffer não bate com a
+        // cópia da última sincronização. Ver a troca de modo logo abaixo.
+        if self.dib_copia.contains_key(&bitmap) {
+            let mut atual = vec![0u8; tamanho];
+            self.cpu.read_mem(buffer, &mut atual)?;
+            let igual = self.dib_copia.get(&bitmap).is_some_and(|c| *c == atual);
+            if igual {
+                let n = self.dib_iguais.entry(bitmap).or_insert(0);
+                *n += 1;
+                // Parou de mudar: vigiar volta a ser mais barato que comparar a cada chamada.
+                if *n >= IGUAIS_PARA_VIGIAR {
+                    self.dib_copia.remove(&bitmap);
+                    self.dib_iguais.remove(&bitmap);
+                    self.cpu.watch_dirty(bitmap, buffer, tamanho as u32)?;
+                    self.cpu.take_dirty(bitmap);
+                    self.dib_mudancas += 1;
+                }
+                return Ok(());
+            }
+            self.dib_iguais.insert(bitmap, 0);
+            if let Some(fb) = self.bitmaps.get_mut(&bitmap) {
+                fb.load_dib_bytes(&atual);
+                fb.toma_sujeira();
+                self.dib_publicado.insert(bitmap, fb.serie());
+            }
+            self.dib_copia.insert(bitmap, atual);
+            return Ok(());
+        }
         // **Só lê quando o guest escreveu nesta superfície.** É a mesma economia que o color
         // buffer do pbuffer já tinha, agora por superfície: a Z-Wheel copiava 1,57 GB em treze
         // segundos virtuais só para descobrir que quase nada tinha mudado.
@@ -1097,6 +1144,17 @@ impl<C: CpuBackend> Machine<C> {
             // iguais, e nada do que desenhamos antes ainda precisa ir para o jogo.
             fb.toma_sujeira();
             self.dib_publicado.insert(bitmap, fb.serie());
+        }
+        // **Vigiar custa uma callback por escrita do jogo.** Compensa quando o jogo sincroniza
+        // muito e escreve pouco (o Pac-Mania: 2.800 sincronizações por quadro). Quando ele pinta
+        // a superfície pixel a pixel e sincroniza uma vez por quadro — o menu do FIFA 09, 83 mil
+        // escritas vigiadas por quadro —, sai mais barato tirar a vigia e comparar o buffer com
+        // uma cópia na hora de sincronizar.
+        if self.cpu.toma_toques(bitmap) >= TOQUES_PARA_COPIA {
+            self.cpu.unwatch_dirty(bitmap);
+            self.dib_copia.insert(bitmap, bytes);
+            self.dib_iguais.insert(bitmap, 0);
+            self.dib_mudancas += 1;
         }
         Ok(())
     }

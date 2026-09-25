@@ -127,6 +127,12 @@ pub trait CpuBackend {
         true
     }
 
+    /// Quantas escritas do guest caíram na faixa de `id` desde a última vez, e zera. Serve para
+    /// decidir se vigiar compensa: cada escrita vigiada é uma ida à callback.
+    fn toma_toques(&mut self, _id: u32) -> u64 {
+        0
+    }
+
     /// Se há faixa armada com este `id`. Sem faixa, `take_dirty` responde sempre sujo.
     fn vigiada(&self, _id: u32) -> bool {
         false

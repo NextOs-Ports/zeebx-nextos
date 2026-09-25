@@ -16,19 +16,25 @@ Amlogic com Mali-400/450, que só têm OpenGL ES 2.0. Branch: `mali450-gles2`.
 | JIT invalida por linha de 64 bytes | `src/cpu/dynarmic.rs` | Variável ao lado do código recompilava a página a cada quadro |
 | JIT dobra constantes de páginas executadas | `is_readonly_memory` | Literal pools iam à callback: 16 mil por quadro no NFS |
 
-## Medidas no Mali-450 (192.168.31.30), quadro 1800
+## Medidas no Mali-450 (192.168.31.30), quadro 1800, CPU abaixo de 77 °C
 
-| Jogo | Upstream (software) | Placa, primeira versão | Agora |
+`nextos/mede.sh` espera a CPU esfriar e registra os resfriadores: o .30 parado fica em 74 °C, e
+durante o jogo a GPU já roda estrangulada. O ruído entre medidas é de uns 5%.
+
+| Jogo | Upstream (software) | Agora | O que mais pesou |
 |---|---|---|---|
-| Resident Evil 4 (título) | 41 fps | 6 fps | 60 fps |
-| Caveman Ninja | 4,8 fps | 8,6 fps | 30,4 fps |
-| Need for Speed Carbon | — | 16,1 fps | 21,6 fps |
-| Quake | — | 19,2 fps | 23,6 fps |
-| Galaxy on Fire | — | 8,6 fps | 36,9 fps |
-| Bejeweled (PopCap) | — | 58,1 fps | 58,1 fps |
+| Resident Evil 4 (abertura 3D) | 27 fps (trava 1,5 s por música) | 42 fps | GLES2, MIDI em segundo plano |
+| Caveman Ninja | 4,8 fps | 30,4 fps | GLES2, sem leitura de volta |
+| Need for Speed Carbon | — | 24,7 fps | JIT por linha, constantes, VFP |
+| Quake | — | 26,1 fps | superfície escalada, VFP |
+| Galaxy on Fire | — | 37–39 fps | JIT, constantes |
+| FIFA 09 (menu) | — | 22,5 fps | modo cópia nas superfícies |
+| Zeebo Sports Tênis | — | 40,5 fps | VFP |
+| Bejeweled (PopCap) | — | 58,1 fps | |
+| Pac-Mania | preto | 8,4 fps | 2D aparecendo; sincronização sem varredura |
 
-O "Placa, primeira versão" é o core só com o GLES2 ligado. Os jogos 3D pesados estão limitados
-pela CPU (A53 a 1,0 GHz): quase metade do tempo é o código do jogo no JIT.
+Os jogos 3D estão limitados pela CPU (A53 a 1,0 GHz). O Pac-Mania faz 2.800 chamadas de desenho
+por quadro, e cada uma sai e volta do JIT: é o próximo alvo.
 
 ## Compilar
 
@@ -48,6 +54,12 @@ A receita da ROM está em `NextOS-Elite-Edition`, `packages/sx05re/libretro/zeeb
 | `ZEEBX_PROF=1` | Amostrador de PC em `/tmp/zeebx-prof.txt`; `nextos/simboliza.py` simboliza |
 | `ZEEBX_LEITURA=1` | Volta a ler o quadro de volta a cada swap |
 | `ZEEBX_SEM_CONSTANTES=1` | Desliga a dobra de constantes do JIT |
+| `ZEEBX_SEM_VFP=1` | Não troca o float por software do RVCT por VFP |
+| `ZEEBX_PERFIL=1` (build) | `build-core.sh` gera `zeebx_libretro-perfil.so` com ponteiros de quadro |
+
+Para achar as funções quentes **do jogo**: `cargo build --release -p zeebx-classical-standalone
+--features zeebx/perfil-guest` e `ZEEBX_PC_HIST=h.txt ./target/release/zeebx run jogo.7z
+--frames=1800 --sem-rede` (sem janela, no interpretador).
 
 ## Pendências conhecidas
 

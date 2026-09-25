@@ -159,7 +159,11 @@ struct Estado {
     /// Ver [`CpuBackend::geracao_das_vigias`].
     geracao: Cell<u64>,
     /// As faixas de [`CpuBackend::watch_dirty`]: `(id, início, fim, sujo)`.
-    vigias: RefCell<Vec<(u32, u32, u32, bool)>>,
+    /// (id, início, fim, sujo, toques): os toques são escritas do guest desde a última
+    /// `toma_toques`, para o dono decidir se a vigia compensa. Ver `CpuBackend::toma_toques`.
+    vigias: RefCell<Vec<(u32, u32, u32, bool, u64)>>,
+    /// A vigia (índice) a que o `atalho` pertence: os toques pelo atalho vão para ela.
+    atalho_dono: Cell<usize>,
     /// O menor intervalo que contém todas as vigias. Quase toda escrita do guest cai fora dele,
     /// e aí ela custa duas comparações em vez de uma volta pela lista.
     envoltorio: Cell<(u32, u32)>,
@@ -227,25 +231,32 @@ impl Estado {
         }
         let (a, b) = self.atalho.get();
         if inicio >= a && fim <= b {
+            if let Some(vigia) = self.vigias.borrow_mut().get_mut(self.atalho_dono.get()) {
+                vigia.4 += 1;
+            }
             return;
         }
         let mut vigias = self.vigias.borrow_mut();
         let mut tocadas = 0;
         let mut faixa = (0, 0);
-        for vigia in vigias.iter_mut() {
+        let mut dono = 0;
+        for (indice, vigia) in vigias.iter_mut().enumerate() {
             if inicio < vigia.2 && fim > vigia.1 {
                 if !vigia.3 {
                     self.geracao.set(self.geracao.get() + 1);
                 }
                 vigia.3 = true;
+                vigia.4 += 1;
                 tocadas += 1;
                 faixa = (vigia.1, vigia.2);
+                dono = indice;
             }
         }
         // O atalho só vale para uma faixa que contém a escrita inteira e é a única tocada:
         // com duas sobrepostas, pular a segunda deixaria de marcá-la.
         if tocadas == 1 && inicio >= faixa.0 && fim <= faixa.1 {
             self.atalho.set(faixa);
+            self.atalho_dono.set(dono);
         }
     }
 
@@ -567,6 +578,7 @@ impl CpuBackend for DynarmicCpu {
             limpa_tudo: Cell::new(false),
             geracao: Cell::new(0),
             vigias: Default::default(),
+            atalho_dono: Cell::new(0),
             envoltorio: Cell::new((0, 0)),
             atalho: Cell::new((0, 0)),
             instrucoes: Cell::new(0),
@@ -634,7 +646,7 @@ impl CpuBackend for DynarmicCpu {
         // Começa sujo: desta faixa ainda não vimos nada.
         jit.vigias
             .borrow_mut()
-            .push((id, base, base.saturating_add(len), true));
+            .push((id, base, base.saturating_add(len), true, 0));
         jit.geracao.set(jit.geracao.get() + 1);
         jit.recalcula_envoltorio();
         // Escrita em faixa vigiada tem de passar pela callback que a marca suja.
@@ -668,6 +680,17 @@ impl CpuBackend for DynarmicCpu {
 
     fn alguma_vigia_suja(&self) -> bool {
         self.jit().map_or(true, |jit| jit.vigias.borrow().iter().any(|v| v.3))
+    }
+
+    fn toma_toques(&mut self, id: u32) -> u64 {
+        let Ok(jit) = self.jit_mut() else {
+            return 0;
+        };
+        jit.vigias
+            .borrow_mut()
+            .iter_mut()
+            .find(|v| v.0 == id)
+            .map_or(0, |v| std::mem::take(&mut v.4))
     }
 
     fn vigiada(&self, id: u32) -> bool {

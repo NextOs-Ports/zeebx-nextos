@@ -1399,6 +1399,10 @@ impl<C: CpuBackend> Machine<C> {
         self.image_notify = image_notify;
         self.dib_do_decodificador = dib_do_decodificador;
         self.dib_publicado = dib_publicado.into_iter().collect();
+        // O modo cópia é do host: volta tudo ao modo de sempre (lido a cada sincronização até a
+        // superfície ser reexposta e vigiada de novo).
+        self.dib_copia.clear();
+        self.dib_iguais.clear();
         self.vetores = vetores;
         self.collections = collections;
         Ok(())
