@@ -29,6 +29,8 @@ const MAX_SEMIHOSTING_STRING: u32 = 4096;
 
 /// Granularidade que o Dynarmic usa para indexar código recompilado.
 const PAGE: u32 = 4096;
+/// A unidade de invalidação de código. Ver [`PaginasExecutadas::linhas`].
+const LINHA: u32 = 64;
 
 /// Quantas páginas de 4 KB cabem nos 32 bits do guest: o tamanho da tabela de páginas.
 const PAGINAS: usize = 1 << 20;
@@ -57,12 +59,46 @@ enum Parada {
 /// 2^20 páginas de 4 KB, 16.384 palavras, 131 KB.
 struct PaginasExecutadas {
     bits: Box<[Cell<u64>]>,
+    /// Por página executada, quais das 64 linhas de 64 bytes o JIT já leu como instrução.
+    ///
+    /// **A página continua sendo a unidade da tabela rápida, mas não da invalidação.** Os jogos
+    /// BREW guardam variáveis e literais na mesma página de 4 KB que o código; invalidando a
+    /// página inteira, cada escrita numa variável recompilava todos os blocos vizinhos — medido
+    /// no NFS Carbon no Mali-450, uma página por quadro e ~6% do processador emitindo código.
+    linhas: RefCell<std::collections::HashMap<u32, u64>>,
 }
 
 impl PaginasExecutadas {
     fn new() -> Self {
         Self {
             bits: (0..(1usize << 20).div_ceil(64)).map(|_| Cell::new(0)).collect(),
+            linhas: RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Anota que a linha de `addr` tem instrução traduzida.
+    fn marca_linha(&self, addr: u32) {
+        *self.linhas.borrow_mut().entry(addr / PAGE).or_insert(0) |= 1 << ((addr % PAGE) / LINHA);
+    }
+
+    /// As linhas com código em `[inicio, fim]` (dentro de uma página), em endereços de linha;
+    /// esquece-as, porque o JIT vai traduzi-las de novo se voltarem a ser executadas.
+    fn tira_linhas(&self, pagina: u32, inicio: u32, fim: u32, saida: &mut BTreeSet<u32>) {
+        let mut linhas = self.linhas.borrow_mut();
+        let Some(mascara) = linhas.get_mut(&pagina) else {
+            return;
+        };
+        let (de, ate) = ((inicio % PAGE) / LINHA, (fim % PAGE) / LINHA);
+        let faixa = if ate >= 63 { u64::MAX << de } else { ((1u64 << (ate + 1)) - 1) & (u64::MAX << de) };
+        let atingidas = *mascara & faixa;
+        if atingidas == 0 {
+            return;
+        }
+        *mascara &= !atingidas;
+        for bit in 0..64 {
+            if atingidas & (1 << bit) != 0 {
+                saida.insert(pagina * PAGE + bit * LINHA);
+            }
         }
     }
 
@@ -81,6 +117,19 @@ impl PaginasExecutadas {
     }
 }
 
+/// Contadores de `ZEEBX_MEDE` (lidos e zerados pelo relatório do core Libretro).
+pub mod conta {
+    use std::sync::atomic::AtomicU64;
+    /// Páginas de código invalidadas (cada uma recompila os blocos dela).
+    pub static INVALIDACOES: AtomicU64 = AtomicU64::new(0);
+    /// Leituras e escritas do guest que caíram na callback, fora da tabela rápida.
+    pub static LENTAS: AtomicU64 = AtomicU64::new(0);
+    /// Leituras dobradas em constante pelo JIT, e quantas vezes o cache foi limpo por escrita
+    /// numa delas.
+    pub static DOBRAS: AtomicU64 = AtomicU64::new(0);
+    pub static LIMPEZAS: AtomicU64 = AtomicU64::new(0);
+}
+
 /// Estado compartilhado entre as callbacks C++ e o invólucro Rust.
 ///
 /// O JIT é guardado em `Box` no backend, então seu endereço não muda quando o `DynarmicCpu`
@@ -94,6 +143,19 @@ struct Estado {
     paginas_executadas: PaginasExecutadas,
     /// Invalidações pedidas pelo ARM durante o bloco em execução; são aplicadas após `run`.
     codigo_sujo: RefCell<BTreeSet<u32>>,
+    /// Linhas de páginas de código que o JIT dobrou em constante (`is_readonly_memory`).
+    ///
+    /// **Só páginas já executadas entram**: elas estão fora da tabela rápida, então toda escrita
+    /// nelas passa por [`Estado::marca_codigo_sujo`] e nenhuma escapa. Uma escrita numa linha
+    /// dobrada pede cache limpo inteiro ([`Estado::limpa_tudo`]), porque o bloco que dobrou pode
+    /// estar em qualquer lugar. Linha já escrita nunca é dobrada ([`Estado::escritas`]).
+    ///
+    /// Existe pelos literal pools: o ARM carrega constantes com `ldr` relativo ao PC, e elas
+    /// moram na página do código. Cada uma virava uma ida à callback — no NFS Carbon, 16 mil por
+    /// quadro no Mali-450.
+    constantes: RefCell<std::collections::HashMap<u32, u64>>,
+    escritas: RefCell<std::collections::HashMap<u32, u64>>,
+    limpa_tudo: Cell<bool>,
     /// As faixas de [`CpuBackend::watch_dirty`]: `(id, início, fim, sujo)`.
     vigias: RefCell<Vec<(u32, u32, u32, bool)>>,
     /// O menor intervalo que contém todas as vigias. Quase toda escrita do guest cai fora dele,
@@ -194,15 +256,57 @@ impl Estado {
         let fim = addr.saturating_add(len.saturating_sub(1));
         for pagina in (addr / PAGE)..=(fim / PAGE) {
             // O teste de um bit vem antes de qualquer empréstimo: quase toda escrita cai em
-            // página de dados, e só a que cai em código paga a lista de sujas.
+            // página de dados, e só a que cai em código paga a consulta das linhas.
             if self.paginas_executadas.contem(pagina) {
-                self.codigo_sujo.borrow_mut().insert(pagina);
+                let de = addr.max(pagina * PAGE);
+                let ate = fim.min(pagina * PAGE + (PAGE - 1));
+                let mascara = mascara_de_linhas(de, ate);
+                *self.escritas.borrow_mut().entry(pagina).or_insert(0) |= mascara;
+                if let Some(dobradas) = self.constantes.borrow_mut().get_mut(&pagina)
+                    && *dobradas & mascara != 0
+                {
+                    *dobradas &= !mascara;
+                    self.limpa_tudo.set(true);
+                }
+                self.paginas_executadas
+                    .tira_linhas(pagina, de, ate, &mut self.codigo_sujo.borrow_mut());
             }
         }
+    }
+
+}
+
+/// As linhas de `[inicio, fim]`, dentro de uma página, como máscara de 64 bits.
+fn mascara_de_linhas(inicio: u32, fim: u32) -> u64 {
+    let (de, ate) = ((inicio % PAGE) / LINHA, (fim % PAGE) / LINHA);
+    if ate >= 63 {
+        u64::MAX << de
+    } else {
+        ((1u64 << (ate + 1)) - 1) & (u64::MAX << de)
     }
 }
 
 impl Callbacks for Estado {
+    extern "C" fn is_readonly_memory(cb: &CallbackImpl<Self>, addr: VAddr) -> bool {
+        static DESLIGADO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DESLIGADO.get_or_init(|| std::env::var_os("ZEEBX_SEM_CONSTANTES").is_some()) {
+            return false;
+        }
+        let pagina = addr / PAGE;
+        // A leitura dobrada pode ter até 8 bytes: fora da página ela cruzaria para outra que
+        // talvez esteja na tabela rápida, onde as escritas não passam por nós.
+        if !cb.paginas_executadas.contem(pagina) || addr % PAGE > PAGE - 8 {
+            return false;
+        }
+        let mascara = mascara_de_linhas(addr, addr + 7);
+        if cb.escritas.borrow().get(&pagina).is_some_and(|e| e & mascara != 0) {
+            return false;
+        }
+        *cb.constantes.borrow_mut().entry(pagina).or_insert(0) |= mascara;
+        conta::DOBRAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     fn memory_read_code(cb: &CallbackImpl<Self>, addr: VAddr) -> Option<u32> {
         let mut bytes = [0; 4];
         if cb.memoria.borrow().executavel(addr) && cb.le(addr, &mut bytes) {
@@ -213,6 +317,7 @@ impl Callbacks for Estado {
                 cb.paginas_executadas.marca(pagina);
                 cb.anula_pagina(pagina);
             }
+            cb.paginas_executadas.marca_linha(addr);
             Some(u32::from_le_bytes(bytes))
         } else {
             Self::para(cb, Parada::Fetch(addr));
@@ -221,6 +326,7 @@ impl Callbacks for Estado {
     }
 
     extern "C" fn memory_read<T: GuestInt>(cb: &CallbackImpl<Self>, addr: VAddr) -> T {
+        conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut bytes = [0u8; 8];
         let len = size_of::<T>();
         if !cb.le(addr, &mut bytes[..len]) {
@@ -232,6 +338,7 @@ impl Callbacks for Estado {
     }
 
     extern "C" fn memory_write<T: GuestInt>(cb: &mut CallbackImpl<Self>, addr: VAddr, value: T) {
+        conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let len = size_of::<T>();
         let bytes = unsafe { std::slice::from_raw_parts((&value as *const T).cast::<u8>(), len) };
         if !cb.escreve(addr, bytes) {
@@ -396,9 +503,15 @@ impl DynarmicCpu {
             return;
         };
         jit.marca_codigo_sujo(addr, len);
-        let paginas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
-        for pagina in paginas {
-            jit.invalidate_cache_range(pagina * PAGE, PAGE as usize);
+        if jit.limpa_tudo.replace(false) {
+            conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jit.codigo_sujo.borrow_mut().clear();
+            jit.clear_cache();
+        }
+        let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
+        for linha in linhas {
+            conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jit.invalidate_cache_range(linha, LINHA as usize);
         }
     }
 }
@@ -434,6 +547,9 @@ impl CpuBackend for DynarmicCpu {
             semihosting: self.semihosting.clone(),
             paginas_executadas: PaginasExecutadas::new(),
             codigo_sujo: Default::default(),
+            constantes: Default::default(),
+            escritas: Default::default(),
+            limpa_tudo: Cell::new(false),
             vigias: Default::default(),
             envoltorio: Cell::new((0, 0)),
             atalho: Cell::new((0, 0)),
@@ -594,9 +710,15 @@ impl CpuBackend for DynarmicCpu {
         let _ = unsafe { jit.run() };
         // Não há invalidação para páginas de dados: só código previamente executado chega aqui.
         // É seguro mexer no cache depois de o JIT devolver o controle, nunca da callback.
-        let paginas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
-        for pagina in paginas {
-            jit.invalidate_cache_range(pagina * PAGE, PAGE as usize);
+        if jit.limpa_tudo.replace(false) {
+            conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jit.codigo_sujo.borrow_mut().clear();
+            jit.clear_cache();
+        }
+        let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
+        for linha in linhas {
+            conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jit.invalidate_cache_range(linha, LINHA as usize);
         }
         match jit.parada.get() {
             Parada::Nenhuma => Ok(StopReason::Budget),
@@ -736,6 +858,43 @@ mod tests {
         assert_eq!(cpu.run(0, 10).unwrap(), StopReason::Returned);
         assert_eq!(cpu.semihosting(), "Z");
         assert_eq!(cpu.read_reg(Reg::R0), 0);
+    }
+
+    /// `ldr r0, [pc, #0xf8]` em 0 lê o literal em 0x100; `bx lr` em 4; em 0x40, `str r1, [r2]`
+    /// e `bx lr`. O literal fica em outra linha que o código, na mesma página.
+    fn cpu_com_literal() -> DynarmicCpu {
+        let mut code = vec![0u8; 0x200];
+        code[0..4].copy_from_slice(&0xe59f_00f8u32.to_le_bytes());
+        code[4..8].copy_from_slice(&0xe12f_ff1eu32.to_le_bytes());
+        code[0x40..0x44].copy_from_slice(&0xe582_1000u32.to_le_bytes());
+        code[0x44..0x48].copy_from_slice(&0xe12f_ff1eu32.to_le_bytes());
+        code[0x100..0x104].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        cpu_with(&code)
+    }
+
+    fn le_literal(cpu: &mut DynarmicCpu) -> u32 {
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+        assert_eq!(cpu.run(0, 10).unwrap(), StopReason::Returned);
+        cpu.read_reg(Reg::R0)
+    }
+
+    #[test]
+    fn literal_dobrado_reescrito_pelo_host_e_relido() {
+        let mut cpu = cpu_com_literal();
+        assert_eq!(le_literal(&mut cpu), 0x1111_1111);
+        cpu.write_mem(0x100, &0x2222_2222u32.to_le_bytes()).unwrap();
+        assert_eq!(le_literal(&mut cpu), 0x2222_2222, "o bloco ficou com a constante velha");
+    }
+
+    #[test]
+    fn literal_dobrado_reescrito_pelo_guest_e_relido() {
+        let mut cpu = cpu_com_literal();
+        assert_eq!(le_literal(&mut cpu), 0x1111_1111);
+        cpu.write_reg(Reg::R1, 0x3333_3333);
+        cpu.write_reg(Reg::R2, 0x100);
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+        assert_eq!(cpu.run(0x40, 10).unwrap(), StopReason::Returned);
+        assert_eq!(le_literal(&mut cpu), 0x3333_3333, "o bloco ficou com a constante velha");
     }
 
     #[test]

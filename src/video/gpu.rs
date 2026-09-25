@@ -2001,6 +2001,10 @@ impl Rasterizador for GpuState {
         self.estado.desenho_em_curso()
     }
 
+    fn quadro_no_frontend(&self) -> bool {
+        self.fbo_externo.is_some() && !leitura_forcada()
+    }
+
     fn desenha_no_fbo(&mut self, fbo: Option<u32>) {
         self.fbo_externo = fbo;
     }

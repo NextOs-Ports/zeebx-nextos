@@ -1073,6 +1073,11 @@ impl Session {
 
     /// O quadro 3D na resolução interna, quando é ele que está à mostra. Ver
     /// [`crate::machine::Machine::quadro_na_placa`].
+    /// Ver [`crate::machine::Machine::retangulo_do_quadro_gl`].
+    pub fn retangulo_do_quadro_gl(&self) -> (usize, usize) {
+        self.machine.retangulo_do_quadro_gl()
+    }
+
     pub fn quadro_na_placa(&self) -> Option<crate::video::rasterizer::QuadroNaPlaca> {
         match self.intermediario {
             Some(_) => None,

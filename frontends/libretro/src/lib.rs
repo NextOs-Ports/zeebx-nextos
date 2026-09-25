@@ -2311,6 +2311,12 @@ pub extern "C" fn retro_run() {
     }
 }
 
+unsafe extern "C" {
+    fn zeebx_prof_dump();
+}
+
+static NS_VIDEO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// O relatório de `ZEEBX_MEDE=1`: a cada 120 quadros, quanto tempo o `retro_run` levou e quanto
 /// disso foi envio de lotes, leitura do quadro e textura, com os desenhos por quadro.
 fn relata_medicao(duracao: std::time::Duration) {
@@ -2331,14 +2337,23 @@ fn relata_medicao(duracao: std::time::Duration) {
         .ok()
         .and_then(|mut g| g.replace(agora))
         .map(|antes| agora.duration_since(antes).as_secs_f64());
+    unsafe { zeebx_prof_dump() };
     let (draws, verts, ms_sub, leituras, ms_ler, texs, ms_tex) = zeebx::video::gpu::mede::colhe();
     let q = n as f64;
     let (ms_apl, ms_unif, ms_draw) = zeebx::video::gpu::mede::colhe_partes();
     log(&format!(
-        "Zeebx MEDE partes: aplica {:.2} ms/q | uniformes {:.2} ms/q | draw {:.2} ms/q",
+        "Zeebx MEDE partes: aplica {:.2} ms/q | uniformes {:.2} ms/q | draw {:.2} ms/q | video (vsync do frontend) {:.2} ms/q",
         ms_apl / q,
         ms_unif / q,
-        ms_draw / q
+        ms_draw / q,
+        NS_VIDEO.swap(0, Relaxed) as f64 / 1e6 / q
+    ));
+    log(&format!(
+        "Zeebx MEDE cpu: {:.1} linhas de código invalidadas/q | {:.0} acessos lentos/q | {} dobras | {} limpezas de cache",
+        zeebx::cpu::dynarmic::conta::INVALIDACOES.swap(0, Relaxed) as f64 / q,
+        zeebx::cpu::dynarmic::conta::LENTAS.swap(0, Relaxed) as f64 / q,
+        zeebx::cpu::dynarmic::conta::DOBRAS.swap(0, Relaxed),
+        zeebx::cpu::dynarmic::conta::LIMPEZAS.swap(0, Relaxed),
     ));
     log(&format!(
         "Zeebx MEDE: {:.1} fps | run {:.2} ms/q | submete {:.2} ms/q ({:.0} draws, {:.0} vert) | leitura {:.2} ms/q ({:.1}/q) | textura {:.2} ms/q ({:.1}/q)",
@@ -2574,6 +2589,20 @@ fn retro_run_dentro() {
         // Vídeo: o framebuffer do console, no formato negociado.
         let tela = estado.session.screen();
         let (largura, altura) = (tela.width(), tela.height());
+        // Com placa, o frontend recorta do framebuffer dele só o retângulo com conteúdo e o estica
+        // para a tela; sem isto, um jogo com superfície menor (Quake, Galaxy on Fire) aparecia num
+        // canto. Ver `Machine::retangulo_do_quadro_gl`.
+        let (largura, altura) = match placa() {
+            Some(_) => {
+                let (l, a) = estado.session.retangulo_do_quadro_gl();
+                if l > 0 && a > 0 && l <= largura as usize && a <= altura as usize {
+                    (l as u32, a as u32)
+                } else {
+                    (largura, altura)
+                }
+            }
+            None => (largura, altura),
+        };
         // O console é 640×480, e é esse o quadro que o shader espera receber. Um tamanho
         // diferente é avisado uma vez, em vez de aparecer como imagem torta sem explicação.
         if !estado.avisou_tamanho && (largura != 640 || altura != 480) {
@@ -2586,7 +2615,11 @@ fn retro_run_dentro() {
         // 30 FPS é cadência de apresentação, não só otimização 3D: no quadro oculto preservamos
         // os bytes anteriores. Se o frontend aceita dupe, entregaremos ponteiro nulo; se não
         // aceita, entregaremos os mesmos bytes de novo — nos dois casos a imagem é realmente 30.
-        let duplicado = if estado.limite_fps_duplica {
+        // Com placa o frontend apresenta o framebuffer dele: converter a tela do console e tirar a
+        // assinatura dela a cada quadro não servia a ninguém (11% do processador no NFS Carbon).
+        let duplicado = if placa().is_some() {
+            false
+        } else if estado.limite_fps_duplica {
             estado.aceita_dupe
         } else {
             tela.write_rgb565_into(&mut quadro);
@@ -2623,8 +2656,12 @@ fn retro_run_dentro() {
             (false, false) => (frame.as_ptr() as *const c_void, ()),
         };
         // SAFETY: o buffer vive durante a chamada; no quadro repetido o frontend reusa o último.
+        let t_video = zeebx::video::gpu::mede::agora();
         unsafe {
             video(ponteiro, largura, altura, largura as usize * 2);
+        }
+        if let Some(t) = t_video {
+            NS_VIDEO.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     // O retorno do lote é em quadros **aceitos**; o que sobrar espera a próxima chamada.

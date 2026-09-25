@@ -1047,6 +1047,15 @@ impl<C: CpuBackend> Machine<C> {
         };
         // O quadro vai direto para o buffer do anterior, em RGB565: sem o vetor de `u16` e a volta
         // para bytes, e sem conversão nenhuma quando nada foi desenhado desde o último.
+        // **No core Libretro com placa o quadro já está no framebuffer do frontend.** Trazer de
+        // volta, converter e copiar para a tela do console era trabalho de todo quadro que
+        // ninguém via (4% do processador no NFS Carbon no Mali-450). Só o lote em curso precisa
+        // ir para a placa antes de o frontend apresentar.
+        if self.gl.quadro_no_frontend() {
+            self.gl.descarrega_o_desenho();
+            self.escritas_do_quadro_gl = Some(self.screen().escritas());
+            return;
+        }
         let mut bytes = std::mem::take(&mut self.gl_last_frame);
         self.gl.frame_rgb565(width, height, &mut bytes);
         match self.bitmaps.get_mut(&self.device_bitmap) {
@@ -1063,6 +1072,16 @@ impl<C: CpuBackend> Machine<C> {
     /// desenho 2D depois disso — um HUD pelo `IDisplay`, uma caixa de mensagem — vive só na tela
     /// do console, e mostrar a textura grande o apagaria. Nesse caso a janela fica com a tela de
     /// 640×480, como sempre.
+    /// O retângulo do quadro 3D com conteúdo, a partir do topo esquerdo: a superfície do EGL.
+    ///
+    /// Um jogo pode desenhar numa superfície menor que a tela e pedir a escala
+    /// (`EGL_QUALCOMM_surface_scale`): Quake e Galaxy on Fire fazem isso. Quando o quadro vai para a
+    /// tela pelo framebuffer do frontend, é este retângulo que o frontend tem de recortar e esticar
+    /// — o mesmo que a leitura de volta reamostrava para 640×480.
+    pub fn retangulo_do_quadro_gl(&self) -> (usize, usize) {
+        self.gl.surface()
+    }
+
     pub fn quadro_na_placa(&self) -> Option<crate::video::rasterizer::QuadroNaPlaca> {
         let intacta = self.escritas_do_quadro_gl == Some(self.screen().escritas());
         intacta.then(|| self.gl.quadro_na_placa()).flatten()
