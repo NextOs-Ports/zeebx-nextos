@@ -1557,6 +1557,8 @@ impl CpuBackend for Interpretador {
             if self.instrucoes >= limite {
                 return Ok(StopReason::Budget);
             }
+            #[cfg(feature = "perfil-guest")]
+            histograma::conta(self.r[15]);
             match self.passo() {
                 Ok(saltou) => {
                     if !saltou {
@@ -1844,5 +1846,28 @@ mod tests {
         cpu.write_reg(Reg::Lr, RETURN_MAGIC);
         assert_eq!(cpu.run(0, 10).unwrap(), StopReason::Returned);
         assert_eq!(cpu.read_reg(Reg::R1), 0);
+    }
+}
+
+
+/// Histograma de PC do guest para a feature `perfil-guest`. Escrito em `ZEEBX_PC_HIST` ao sair.
+#[cfg(feature = "perfil-guest")]
+pub mod histograma {
+    use std::cell::RefCell;
+    thread_local! {
+        static CONTAS: RefCell<rustc_hash::FxHashMap<u32, u64>> = RefCell::new(Default::default());
+    }
+    pub fn conta(pc: u32) {
+        CONTAS.with(|c| *c.borrow_mut().entry(pc).or_insert(0) += 1);
+    }
+    /// Grava "pc contagem" por linha, do mais executado ao menos.
+    pub fn grava() {
+        let Some(caminho) = std::env::var_os("ZEEBX_PC_HIST") else {
+            return;
+        };
+        let mut v: Vec<(u32, u64)> = CONTAS.with(|c| c.borrow().iter().map(|(&a, &b)| (a, b)).collect());
+        v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let texto: String = v.iter().map(|(pc, n)| format!("{pc:08x} {n}\n")).collect();
+        let _ = std::fs::write(caminho, texto);
     }
 }

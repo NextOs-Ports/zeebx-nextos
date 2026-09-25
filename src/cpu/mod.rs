@@ -271,14 +271,24 @@ pub mod dynarmic;
 /// Interpretador A32/T32. Existe porque o `dynarmic` emite código nativo do host, e um módulo
 /// WebAssembly não executa esse bloco. Entra no `wasm32` e nos testes do próprio arquivo; o
 /// desktop continua no JIT.
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(any(test, target_arch = "wasm32", feature = "perfil-guest"))]
 pub mod interpretador;
 
 /// O alias que o resto do código usa para pedir "o backend padrão".
-#[cfg(not(target_arch = "wasm32"))]
+///
+/// Com a feature `perfil-guest` o desktop usa o interpretador, que conta instruções por PC do
+/// jogo (`ZEEBX_PC_HIST`): é o único jeito de saber **qual função do jogo** pesa, porque no JIT o
+/// PC do host não diz nada sobre o do guest.
+#[cfg(not(any(target_arch = "wasm32", feature = "perfil-guest")))]
 pub type BackendPadrao = dynarmic::DynarmicCpu;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "perfil-guest"))]
 pub type BackendPadrao = interpretador::Interpretador;
+
+/// Grava o histograma de PC do guest (feature `perfil-guest`); sem a feature não faz nada.
+pub fn grava_perfil_guest() {
+    #[cfg(feature = "perfil-guest")]
+    interpretador::histograma::grava();
+}
 
 // As constantes da faixa de vtables do BREW são parte do contrato entre o backend e o despachante.
 pub use faixas_do_brew::{API_BASE, API_SIZE, RETURN_MAGIC};

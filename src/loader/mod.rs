@@ -14,6 +14,7 @@ pub mod sete_z;
 pub mod miffile;
 pub mod modfile;
 pub mod resfile;
+pub mod vfp;
 
 use crate::brew::aee::{self, Interface};
 use crate::cpu::CpuError;
@@ -217,7 +218,26 @@ pub fn load_with(
     let mut module_bytes = vec![0u8; MODULE_PREFIX as usize];
     module_bytes.extend_from_slice(image.image());
     module_bytes.resize(module_bytes.len() + MODULE_BSS_SLACK, 0);
+    // Ponto flutuante por software trocado por VFP. Só com o Dynarmic: o interpretador (web e
+    // `perfil-guest`) não executa VFP. `ZEEBX_SEM_VFP=1` desliga. Ver `vfp`.
+    let trampolins = match cfg!(not(any(target_arch = "wasm32", feature = "perfil-guest")))
+        && std::env::var_os("ZEEBX_SEM_VFP").is_none()
+    {
+        true => {
+            let (bytes, trocas) = vfp::acelera(&mut module_bytes, MODULE_BASE - MODULE_PREFIX);
+            if !trocas.is_empty() {
+                let lista: Vec<String> =
+                    trocas.iter().map(|t| format!("{}@{:#x}", t.nome, t.entrada)).collect();
+                eprintln!("Zeebx: float por software trocado por VFP: {}", lista.join(", "));
+            }
+            bytes
+        }
+        false => Vec::new(),
+    };
     mem.map("module", MODULE_BASE - MODULE_PREFIX, module_bytes, true)?;
+    if !trampolins.is_empty() {
+        mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins, false, true)?;
+    }
     // **A página nula se lê, e dá zero.** No console não há proteção de memória, e o que
     // mora nos endereços baixos é legível: um jogo que lê por um ponteiro nulo recebe algum
     // valor e segue. O Aviãozinho, um port do Quake feito por fãs, faz isso ao carregar a

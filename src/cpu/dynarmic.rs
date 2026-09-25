@@ -933,6 +933,52 @@ mod tests {
         assert_eq!(le_literal(&mut cpu), 0x3333_3333, "o bloco ficou com a constante velha");
     }
 
+    /// O float por software trocado por VFP (`loader::vfp`) dá a mesma conta, executado pelo
+    /// Dynarmic: cada rotina é chamada com `bl` a partir de 0x40 e volta para o sentinela.
+    #[test]
+    fn rotinas_de_float_trocadas_por_vfp_fazem_a_conta() {
+        use crate::loader::vfp;
+        // As assinaturas ficam em 0x100, 0x200, ... de um módulo de teste; `acelera` as troca.
+        let assinaturas: Vec<Vec<u32>> = vfp::assinaturas_para_teste();
+        let mut modulo = vec![0u8; 0x1000];
+        for (i, a) in assinaturas.iter().enumerate() {
+            let off = 0x100 * (i + 1);
+            for (k, w) in a.iter().enumerate() {
+                modulo[off + 4 * k..off + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        let (trampolins, trocas) = vfp::acelera(&mut modulo, 0);
+        assert_eq!(trocas.len(), 6, "{trocas:?}");
+        let chama = |nome: &str, r0: u32, r1: u32| -> u32 {
+            let entrada = trocas.iter().find(|t| t.nome == nome).unwrap().entrada;
+            let mut m = modulo.clone();
+            // bl entrada ; bx lr (o lr de fora é o sentinela, guardado em r4)
+            let bl = 0xeb00_0000 | ((entrada.wrapping_sub(0x40 + 8) >> 2) & 0x00ff_ffff);
+            m[0x40..0x44].copy_from_slice(&bl.to_le_bytes());
+            m[0x44..0x48].copy_from_slice(&0xe12f_ff14u32.to_le_bytes()); // bx r4
+            let mut mem = GuestMemory::new();
+            mem.map("code", 0, m, true).unwrap();
+            mem.map_com_execucao("vfp", vfp::VFP_BASE, trampolins.clone(), false, true).unwrap();
+            mem.map_zeroed("stack", 0x2000_0000, 0x1000).unwrap();
+            let mut cpu = DynarmicCpu::new().unwrap();
+            cpu.reset(&mem).unwrap();
+            cpu.write_reg(Reg::Sp, 0x2000_0f00);
+            cpu.write_reg(Reg::R0, r0);
+            cpu.write_reg(Reg::R1, r1);
+            cpu.write_reg(Reg::R4, RETURN_MAGIC);
+            assert_eq!(cpu.run(0x40, 100).unwrap(), StopReason::Returned, "{nome}");
+            cpu.read_reg(Reg::R0)
+        };
+        let f = f32::to_bits;
+        assert_eq!(chama("fadd", f(1.5), f(2.25)), f(3.75));
+        assert_eq!(chama("fsub", f(1.5), f(2.25)), f(-0.75));
+        assert_eq!(chama("fmul", f(1.5), f(-4.0)), f(-6.0));
+        assert_eq!(chama("fdiv", f(1.0), f(4.0)), f(0.25));
+        assert_eq!(chama("fflt", (-7i32) as u32, 0), f(-7.0));
+        assert_eq!(chama("ffix", f(-7.9), 0), (-7i32) as u32, "trunca para zero");
+        assert_eq!(chama("ffix", f(3.0e10), 0), i32::MAX as u32, "satura");
+    }
+
     #[test]
     fn codigo_alterado_pelo_host_e_recompilado() {
         let mut cpu = cpu_with(

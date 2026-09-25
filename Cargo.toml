@@ -29,6 +29,8 @@ path = "src/lib.rs"
 # linka nada disso: vídeo, áudio e entrada chegam por callback do frontend.
 [features]
 default = ["desktop"]
+# Interpretador com histograma de PC do jogo, para achar as funções quentes. Ver `cpu::BackendPadrao`.
+perfil-guest = []
 desktop = [
     # A UI desktop usa o rasterizador na placa: o desktop implica `gpu`.
     "gpu",

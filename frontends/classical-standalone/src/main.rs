@@ -683,6 +683,12 @@ fn aparelhos(lista: &str) -> Option<[Option<bindings::Aparelho>; input::PORTAS]>
 }
 
 fn run(path: &str, options: Options) -> Result<(), Box<dyn std::error::Error>> {
+    let r = run_dentro(path, options);
+    zeebx::cpu::grava_perfil_guest();
+    r
+}
+
+fn run_dentro(path: &str, options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let Options {
         tracing,
         trace_filter,
