@@ -238,8 +238,72 @@ fn bytes_per_texel(format: u32, kind: u32) -> u32 {
     }
 }
 
+/// Os canais de 4, 5 e 6 bits já espalhados para 8, na mesma conta do `expand` de
+/// [`decode_texels_generico`] — `(v * 255 + max / 2) / max` —, feita uma vez em tempo de compilação.
+const fn tabela_de_expansao<const N: usize>() -> [u8; N] {
+    let max = (N - 1) as u32;
+    let mut t = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        t[i] = ((i as u32 * 255 + max / 2) / max) as u8;
+        i += 1;
+    }
+    t
+}
+const EXPANDE_4: [u8; 16] = tabela_de_expansao::<16>();
+const EXPANDE_5: [u8; 32] = tabela_de_expansao::<32>();
+const EXPANDE_6: [u8; 64] = tabela_de_expansao::<64>();
+
 /// Converte os texels para RGBA de 8 bits, o formato único do rasterizador.
+///
+/// Os cinco formatos que os jogos usam vão por laços próprios, com a expansão em tabela; o resto
+/// cai na conversão texel a texel. O menu do FIFA 09 sobe uma textura RGB565 de 512×256 a cada
+/// quadro, e a conversão genérica fazia três divisões inteiras e um `match` por texel.
 fn decode_texels(bytes: &[u8], format: u32, kind: u32, count: usize) -> Vec<[u8; 4]> {
+    let tamanho = bytes_per_texel(format, kind) as usize;
+    let inteiros = (bytes.len() / tamanho).min(count);
+    let origem = &bytes[..inteiros * tamanho];
+    let mut saida: Vec<[u8; 4]> = Vec::with_capacity(count);
+    let dezesseis = || {
+        origem
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as usize)
+    };
+    match (kind, format) {
+        (gles::GL_UNSIGNED_SHORT_5_6_5, _) => saida.extend(dezesseis().map(|v| {
+            [EXPANDE_5[v >> 11], EXPANDE_6[(v >> 5) & 0x3f], EXPANDE_5[v & 0x1f], 255]
+        })),
+        (gles::GL_UNSIGNED_SHORT_4_4_4_4, _) => saida.extend(dezesseis().map(|v| {
+            [
+                EXPANDE_4[v >> 12],
+                EXPANDE_4[(v >> 8) & 0xf],
+                EXPANDE_4[(v >> 4) & 0xf],
+                EXPANDE_4[v & 0xf],
+            ]
+        })),
+        (gles::GL_UNSIGNED_SHORT_5_5_5_1, _) => saida.extend(dezesseis().map(|v| {
+            [
+                EXPANDE_5[v >> 11],
+                EXPANDE_5[(v >> 6) & 0x1f],
+                EXPANDE_5[(v >> 1) & 0x1f],
+                if v & 1 != 0 { 255 } else { 0 },
+            ]
+        })),
+        (gles::GL_UNSIGNED_BYTE, gles::GL_RGB) => {
+            saida.extend(origem.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]))
+        }
+        (gles::GL_UNSIGNED_BYTE, gles::GL_RGBA) => {
+            saida.extend(origem.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]))
+        }
+        _ => return decode_texels_generico(bytes, format, kind, count),
+    }
+    // O que faltou no fim do buffer sai branco opaco, como na conversão genérica.
+    saida.resize(count, [255; 4]);
+    saida
+}
+
+/// A conversão texel a texel, para os formatos sem laço próprio em [`decode_texels`].
+fn decode_texels_generico(bytes: &[u8], format: u32, kind: u32, count: usize) -> Vec<[u8; 4]> {
     // Repetir os cinco bits mais altos nos três de baixo espalha o valor por toda a faixa: é o
     // que faz 0b11111 virar 255 e não 248.
     let expand = |value: u16, bits: u32| -> u8 {
@@ -297,6 +361,38 @@ fn decode_texels(bytes: &[u8], format: u32, kind: u32, count: usize) -> Vec<[u8;
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod testes_de_texels {
+    use super::*;
+
+    /// Os laços rápidos dão o mesmo que a conversão texel a texel em todo valor de 16 bits, e nos
+    /// formatos de byte, com um buffer curto que deixa texels sem dado no fim.
+    #[test]
+    fn conversao_rapida_igual_a_generica() {
+        let todos: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        for kind in [
+            gles::GL_UNSIGNED_SHORT_5_6_5,
+            gles::GL_UNSIGNED_SHORT_4_4_4_4,
+            gles::GL_UNSIGNED_SHORT_5_5_5_1,
+        ] {
+            let n = todos.len() / 2;
+            assert_eq!(
+                decode_texels(&todos, gles::GL_RGB, kind, n + 3),
+                decode_texels_generico(&todos, gles::GL_RGB, kind, n + 3),
+                "tipo {kind:#x}"
+            );
+        }
+        let bytes: Vec<u8> = (0..=250u8).collect();
+        for format in [gles::GL_RGB, gles::GL_RGBA, gles::GL_LUMINANCE] {
+            assert_eq!(
+                decode_texels(&bytes, format, gles::GL_UNSIGNED_BYTE, 100),
+                decode_texels_generico(&bytes, format, gles::GL_UNSIGNED_BYTE, 100),
+                "formato {format:#x}"
+            );
+        }
+    }
 }
 
 /// A classe que sabe abrir um tipo MIME, para o `ISHELL_GetHandler`.
