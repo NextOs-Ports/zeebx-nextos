@@ -34,6 +34,59 @@ use super::rasterizer::{
     UnidadeDeTextura, Vertex,
 };
 use glow::{self, HasContext};
+
+/// Medição por quadro no aparelho (`ZEEBX_MEDE=1`): quanto tempo vai no envio de lotes, na leitura
+/// do quadro de volta e quantos desenhos cada quadro faz. Sem a variável, custa uma leitura de
+/// atômico por chamada.
+pub mod mede {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    pub static LIGADO: AtomicBool = AtomicBool::new(false);
+    pub static DRAWS: AtomicU64 = AtomicU64::new(0);
+    pub static VERTICES: AtomicU64 = AtomicU64::new(0);
+    pub static NS_SUBMETE: AtomicU64 = AtomicU64::new(0);
+    pub static LEITURAS: AtomicU64 = AtomicU64::new(0);
+    pub static NS_LEITURA: AtomicU64 = AtomicU64::new(0);
+    pub static TEXTURAS: AtomicU64 = AtomicU64::new(0);
+    pub static NS_UNIF: AtomicU64 = AtomicU64::new(0);
+    pub static NS_DRAW: AtomicU64 = AtomicU64::new(0);
+    pub static NS_APLICA: AtomicU64 = AtomicU64::new(0);
+    pub static FINISH: AtomicBool = AtomicBool::new(false);
+    pub static NS_TEXTURA: AtomicU64 = AtomicU64::new(0);
+    pub fn liga() {
+        LIGADO.store(std::env::var_os("ZEEBX_MEDE").is_some(), Relaxed);
+        FINISH.store(std::env::var("ZEEBX_MEDE").is_ok_and(|v| v == "2"), Relaxed);
+    }
+    #[inline]
+    pub fn ligado() -> bool {
+        LIGADO.load(Relaxed)
+    }
+    pub fn soma(contador: &AtomicU64, inicio: Option<std::time::Instant>) {
+        if let Some(t) = inicio {
+            contador.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+    pub fn agora() -> Option<std::time::Instant> {
+        ligado().then(std::time::Instant::now)
+    }
+    /// Zera e devolve `(ms_aplica, ms_uniformes, ms_draw)`.
+    pub fn colhe_partes() -> (f64, f64, f64) {
+        let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
+        (ms(&NS_APLICA), ms(&NS_UNIF), ms(&NS_DRAW))
+    }
+    /// Zera e devolve `(draws, vertices, ms_submete, leituras, ms_leitura, texturas, ms_textura)`.
+    pub fn colhe() -> (u64, u64, f64, u64, f64, u64, f64) {
+        let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
+        (
+            DRAWS.swap(0, Relaxed),
+            VERTICES.swap(0, Relaxed),
+            ms(&NS_SUBMETE),
+            LEITURAS.swap(0, Relaxed),
+            ms(&NS_LEITURA),
+            TEXTURAS.swap(0, Relaxed),
+            ms(&NS_TEXTURA),
+        )
+    }
+}
 use std::collections::HashMap;
 
 /// `GL_TEXTURE_MAX_ANISOTROPY` e o máximo que a placa aceita, da extensão
@@ -49,6 +102,22 @@ const VERTICES_NO_ANEL: usize = 1 << 16;
 
 /// Quantos vértices um lote junta antes de ir à placa mesmo sem mudança de estado.
 const VERTICES_NO_LOTE: usize = 1 << 14;
+
+
+/// Soma o tempo do escopo num contador de [`mede`] quando a medição está ligada.
+struct Cronometro(&'static std::sync::atomic::AtomicU64, Option<std::time::Instant>);
+impl Drop for Cronometro {
+    fn drop(&mut self) {
+        mede::soma(self.0, self.1);
+    }
+}
+
+/// `ZEEBX_LEITURA=1`: lê o quadro de volta mesmo no framebuffer do frontend. Ver
+/// [`GpuState::frame_rgb565`].
+fn leitura_forcada() -> bool {
+    static FORCADA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCADA.get_or_init(|| std::env::var_os("ZEEBX_LEITURA").is_some())
+}
 
 /// O que a placa precisa saber de uma textura do jogo, além dos pixels que já estão nela.
 struct Textura {
@@ -170,7 +239,13 @@ pub struct GpuState {
     programa: glow::Program,
     /// Onde fica cada uniforme do programa, e o que foi mandado para ele por último.
     uniformes: Uniformes,
-    vao: glow::VertexArray,
+    /// No ES 2.0, um programa por combinação de estado. Ver [`Variante`].
+    variantes: HashMap<Variante, (glow::Program, Uniformes)>,
+    variante_atual: Option<Variante>,
+    vao: Option<glow::VertexArray>,
+    /// A placa só fala OpenGL ES 2.0 (Mali-400/450): sem VAO, sem formato interno com tamanho,
+    /// sem MSAA, sem blit, profundidade e stencil em anexos separados, shaders GLSL ES 1.00.
+    es2: bool,
     vbo: glow::Buffer,
     /// O buffer de vértices é um anel: `(capacidade, próximo livre)`, em vértices.
     ///
@@ -279,9 +354,17 @@ impl GpuState {
                 )
             }
         };
+        let es2 = {
+            let versao = gl.version();
+            versao.is_embedded && versao.major < 3
+        };
         let (programa, vao, vbo, ponte) = unsafe {
-            let programa = compila(&gl)?;
-            let vao = gl.create_vertex_array()?;
+            let programa = compila(&gl, es2)?;
+            // No ES 2.0 o VAO é extensão; os ponteiros de atributo são repostos a cada lote.
+            let vao = match es2 {
+                true => None,
+                false => Some(gl.create_vertex_array()?),
+            };
             let vbo = gl.create_buffer()?;
             let ponte = gl.create_texture()?;
             (programa, vao, vbo, ponte)
@@ -304,7 +387,10 @@ impl GpuState {
             quadro: None,
             programa,
             uniformes: Uniformes::default(),
+            variantes: HashMap::new(),
+            variante_atual: None,
             vao,
+            es2,
             vbo,
             anel: (0, 0),
             vao_pronto: false,
@@ -338,6 +424,14 @@ impl GpuState {
     /// larga saía com o dobro dos lados. E só havia lados quando a superfície era do tamanho do
     /// quadro — no Quake, nunca: o 16:9 não abria nada, e com a resolução interna acima de 1 o
     /// quadro ia à janela na proporção da superfície, estreito e menor.
+    /// O formato interno da cor: com tamanho no OpenGL/ES 3, sem tamanho no ES 2.0.
+    fn formato_cor(&self) -> i32 {
+        match self.es2 {
+            true => glow::RGBA as i32,
+            false => glow::RGBA8 as i32,
+        }
+    }
+
     fn extra(&self) -> usize {
         let (fw, fh) = self.estado.frame_size();
         let Some(aspecto) = self.proporcao else {
@@ -393,7 +487,7 @@ impl GpuState {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RGBA8 as i32,
+                self.formato_cor(),
                 largura,
                 altura,
                 0,
@@ -441,12 +535,21 @@ impl GpuState {
             );
             let multi = match amostras > 1 {
                 false => {
-                    gl.framebuffer_renderbuffer(
-                        glow::FRAMEBUFFER,
-                        glow::DEPTH_STENCIL_ATTACHMENT,
-                        glow::RENDERBUFFER,
-                        Some(profundidade),
-                    );
+                    // No ES 2.0 não existe `DEPTH_STENCIL_ATTACHMENT` (0x821A): passar o enum ao
+                    // Mali é INVALID_ENUM silencioso e o framebuffer fica sem profundidade. O
+                    // renderbuffer empacotado (`OES_packed_depth_stencil`) entra nos dois anexos.
+                    let anexos: &[u32] = match self.es2 {
+                        true => &[glow::DEPTH_ATTACHMENT, glow::STENCIL_ATTACHMENT],
+                        false => &[glow::DEPTH_STENCIL_ATTACHMENT],
+                    };
+                    for &anexo in anexos {
+                        gl.framebuffer_renderbuffer(
+                            glow::FRAMEBUFFER,
+                            anexo,
+                            glow::RENDERBUFFER,
+                            Some(profundidade),
+                        );
+                    }
                     None
                 }
                 true => {
@@ -625,7 +728,7 @@ impl GpuState {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::RGBA8 as i32,
+                    self.formato_cor(),
                     salva.width as i32,
                     salva.height as i32,
                     0,
@@ -648,7 +751,7 @@ impl GpuState {
                     gl.tex_image_2d(
                         glow::TEXTURE_2D,
                         nivel_gl as i32,
-                        glow::RGBA8 as i32,
+                        self.formato_cor(),
                         nivel.width as i32,
                         nivel.height as i32,
                         0,
@@ -694,6 +797,9 @@ impl GpuState {
             }
         }
         self.uniformes = Uniformes::default();
+        for (_, u) in self.variantes.values_mut() {
+            *u = Uniformes::default();
+        }
         self.anel = (0, 0);
         self.vao_pronto = false;
         self.lote.clear();
@@ -733,7 +839,9 @@ impl GpuState {
             //
             // É core desde o OpenGL 3.2, que é o perfil pedido. Na queda para GLES 3.x ele não
             // existe e a chamada não tem efeito: ali o plano distante volta a recortar.
-            gl.enable(glow::DEPTH_CLAMP);
+            if !self.es2 {
+                gl.enable(glow::DEPTH_CLAMP);
+            }
             // O `glScissor` do jogo vem em pixels do console, com o `y` de baixo para cima —
             // a mesma convenção da viewport —, e o anexo é `escala` vezes maior. Ver
             // [`tesoura_no_anexo`].
@@ -799,8 +907,15 @@ impl GpuState {
         if quantos == 0 {
             return;
         }
+        let t_mede = mede::agora();
+        if t_mede.is_some() {
+            mede::DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            mede::VERTICES.fetch_add(quantos as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let t_aplica = mede::agora();
         self.destino();
         self.aplica();
+        mede::soma(&mede::NS_APLICA, t_aplica);
         let textura_da_ponte = textura.is_some();
         let textura = textura.or_else(|| {
             self.fill
@@ -813,13 +928,43 @@ impl GpuState {
             (false, true) => self.texturas.get(&self.fill.unidade1.textura).map(|t| t.objeto),
             _ => None,
         };
+        if self.es2 {
+            let neblina = self.fill.neblina;
+            let chave = Variante {
+                t0: textura.map(|_| ChaveEnv::de(&self.fill.env_textura)),
+                t1: textura1.map(|_| ChaveEnv::de(&self.fill.unidade1.env)),
+                neblina: neblina.ligada && neblina.permitida,
+                alfa: match self.fill.teste_alfa {
+                    true => codigo_alfa(self.fill.func_alfa),
+                    false => 7,
+                },
+            };
+            if !self.variantes.contains_key(&chave) {
+                match unsafe { liga_es2(&self.gl, &fragmento_es2(&chave)) } {
+                    Ok(programa) => {
+                        self.variantes.insert(chave, (programa, Uniformes::default()));
+                    }
+                    Err(erro) => {
+                        eprintln!("Zeebx: variante de shader ES 2.0 recusada ({erro}); usando o geral");
+                        self.variantes.insert(chave, (self.programa, Uniformes::default()));
+                    }
+                }
+            }
+            self.variante_atual = Some(chave);
+        } else {
+            self.variante_atual = None;
+        }
         let gl = &self.gl;
+        let (programa, uniformes) = match self.variante_atual.and_then(|c| self.variantes.get(&c)) {
+            Some((p, u)) => (*p, u),
+            None => (self.programa, &self.uniformes),
+        };
         unsafe {
-            gl.use_program(Some(self.programa));
-            gl.bind_vertex_array(Some(self.vao));
+            gl.use_program(Some(programa));
+            gl.bind_vertex_array(self.vao);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
             let passo = (FLOATS_POR_VERTICE * 4) as i32;
-            if !self.vao_pronto {
+            if !self.vao_pronto || self.es2 {
                 for (indice, tamanho, deslocamento) in
                     [(0u32, 4i32, 0i32), (1, 4, 16), (2, 2, 32), (3, 1, 40), (4, 2, 44)]
                 {
@@ -835,8 +980,21 @@ impl GpuState {
                 }
                 self.vao_pronto = true;
             }
+            // **No ES 2.0 (Mali Utgard) o anel custa uma espera por desenho.** Escrever com
+            // `glBufferSubData` num buffer que a placa ainda lê faz o driver esperar o desenho
+            // anterior terminar: medido no Mali-450, 3,4 ms por desenho e 188 ms por quadro com 55
+            // desenhos. `glBufferData` com os dados dá memória nova ao buffer (orphaning) e o
+            // driver não espera ninguém.
+            let orfao = self.es2;
             let (capacidade, livre) = self.anel;
-            if livre + quantos > capacidade {
+            if orfao {
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    bytes_de_f32(&self.vertices),
+                    glow::STREAM_DRAW,
+                );
+                self.anel = (0, 0);
+            } else if livre + quantos > capacidade {
                 // O buffer novo não espera os desenhos que ainda usam o antigo: o driver
                 // entrega outra memória, e a de antes é solta quando eles terminam.
                 let capacidade = VERTICES_NO_ANEL.max(quantos);
@@ -848,54 +1006,66 @@ impl GpuState {
                 self.anel = (capacidade, 0);
             }
             let primeiro = self.anel.1;
-            gl.buffer_sub_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                primeiro as i32 * passo,
-                bytes_de_f32(&self.vertices),
-            );
-            self.anel.1 += quantos;
+            if !orfao {
+                gl.buffer_sub_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    primeiro as i32 * passo,
+                    bytes_de_f32(&self.vertices),
+                );
+                self.anel.1 += quantos;
+            }
+            let t_unif = mede::agora();
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, textura);
-            uniforme_i32(gl, &self.uniformes, self.programa, "amostra", 0);
-            uniforme_i32(gl, &self.uniformes, self.programa, "texturando", i32::from(textura.is_some()));
-            envia_env(gl, &self.uniformes, self.programa, "", &self.fill.env_textura);
+            uniforme_i32(gl, uniformes, programa, "amostra", 0);
+            uniforme_i32(gl, uniformes, programa, "texturando", i32::from(textura.is_some()));
+            envia_env(gl, uniformes, programa, "", &self.fill.env_textura);
             // A unidade 1 só entra com textura de verdade: ligada sem textura carregada, ela
             // passaria o anterior adiante com um texel preto.
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, textura1);
             gl.active_texture(glow::TEXTURE0);
-            uniforme_i32(gl, &self.uniformes, self.programa, "amostra1", 1);
-            uniforme_i32(gl, &self.uniformes, self.programa, "texturando1", i32::from(textura1.is_some()));
+            uniforme_i32(gl, uniformes, programa, "amostra1", 1);
+            uniforme_i32(gl, uniformes, programa, "texturando1", i32::from(textura1.is_some()));
             if textura1.is_some() {
-                envia_env(gl, &self.uniformes, self.programa, "1", &self.fill.unidade1.env);
+                envia_env(gl, uniformes, programa, "1", &self.fill.unidade1.env);
             }
             uniforme_i32(
                 gl,
-                &self.uniformes,
-                self.programa,
+                uniformes,
+                programa,
                 "func_alfa",
                 match self.fill.teste_alfa {
                     true => codigo_alfa(self.fill.func_alfa),
                     false => 7,
                 },
             );
-            uniforme_f32(gl, &self.uniformes, self.programa, "ref_alfa", self.fill.ref_alfa);
-            uniforme_f32(gl, &self.uniformes, self.programa, "virar", virar);
+            uniforme_f32(gl, uniformes, programa, "ref_alfa", self.fill.ref_alfa);
+            uniforme_f32(gl, uniformes, programa, "virar", virar);
             let neblina = self.fill.neblina;
             uniforme_i32(
                 gl,
-                &self.uniformes,
-                self.programa,
+                uniformes,
+                programa,
                 "com_neblina",
                 i32::from(neblina.ligada && neblina.permitida),
             );
-            uniforme_vec3(gl, &self.uniformes, self.programa, "cor_neblina", neblina.cor);
+            uniforme_vec3(gl, uniformes, programa, "cor_neblina", neblina.cor);
+            mede::soma(&mede::NS_UNIF, t_unif);
+            let t_draw = mede::agora();
             gl.draw_arrays(modo, primeiro as i32, quantos as i32);
-            gl.bind_vertex_array(None);
+            if mede::FINISH.load(std::sync::atomic::Ordering::Relaxed) {
+                gl.finish();
+            }
+            mede::soma(&mede::NS_DRAW, t_draw);
+            if self.vao.is_some() {
+                gl.bind_vertex_array(None);
+            }
             gl.use_program(None);
         }
         self.devolve_o_contexto();
         self.sujo = true;
+        mede::soma(&mede::NS_SUBMETE, t_mede);
     }
 
     /// Empilha um vértice no buffer de envio.
@@ -933,7 +1103,7 @@ impl GpuState {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::RGBA8 as i32,
+                    self.formato_cor(),
                     fw,
                     fh,
                     0,
@@ -1033,7 +1203,11 @@ impl GpuState {
     ///
     /// Com contexto próprio isto não custa nada porque não roda: ninguém mais o usa.
     fn devolve_o_contexto(&self) {
-        if !self.emprestado {
+        // **No core Libretro não há ninguém a quem devolver.** O frontend entrega o framebuffer
+        // (`fbo_externo`) e refaz o próprio estado depois do `retro_run`. Devolver aqui desligava
+        // o framebuffer a cada desenho, e numa placa por blocos (Mali-400/450) cada troca de
+        // framebuffer grava e recarrega a tela inteira: medido no RE4, ~5 ms por desenho.
+        if !self.emprestado || self.fbo_externo.is_some() {
             return;
         }
         let gl = &self.gl;
@@ -1043,7 +1217,9 @@ impl GpuState {
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::STENCIL_TEST);
-            gl.disable(glow::DEPTH_CLAMP);
+            if !self.es2 {
+                gl.disable(glow::DEPTH_CLAMP);
+            }
             gl.disable(glow::BLEND);
             gl.depth_mask(true);
             gl.depth_range_f32(0.0, 1.0);
@@ -1073,7 +1249,9 @@ impl GpuState {
             };
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, min as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, t.filtro as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, t.maior_nivel as i32);
+            if !self.es2 {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, t.maior_nivel as i32);
+            }
             for (eixo, modo) in [
                 (glow::TEXTURE_WRAP_S, t.wrap[0]),
                 (glow::TEXTURE_WRAP_T, t.wrap[1]),
@@ -1094,7 +1272,14 @@ impl Drop for GpuState {
         let gl = &self.gl;
         unsafe {
             gl.delete_program(self.programa);
-            gl.delete_vertex_array(self.vao);
+            for (programa, _) in self.variantes.values() {
+                if *programa != self.programa {
+                    gl.delete_program(*programa);
+                }
+            }
+            if let Some(vao) = self.vao {
+                gl.delete_vertex_array(vao);
+            }
             gl.delete_buffer(self.vbo);
             gl.delete_texture(self.ponte);
             for t in self.texturas.values() {
@@ -1488,15 +1673,247 @@ void main() {
 }
 "#;
 
-/// Compila o par de shaders, tentando GLSL 3.30 e caindo para ES 3.00.
-unsafe fn compila(gl: &glow::Context) -> Result<glow::Program, String> {
+/// Os atributos do vértice, na ordem dos `layout(location = N)` de [`VERTICE`].
+///
+/// No GLSL ES 1.00 não há `layout`: os índices são fixados com `glBindAttribLocation` antes do
+/// link, para que os ponteiros de [`GpuState::submete_com`] continuem valendo.
+const ATRIBUTOS: [&str; 5] = ["pos", "cor", "uv", "fog", "uv1"];
+
+/// Traduz um shader escrito em GLSL 3.30/ES 3.00 para GLSL ES 1.00 (OpenGL ES 2.0).
+///
+/// A tradução é textual e cobre só o que os dois shaders deste arquivo usam: `in`/`out` viram
+/// `attribute`/`varying`, `layout(location = N)` sai (o índice vai pelo `glBindAttribLocation`),
+/// `texture()` vira `texture2D()` e a saída do fragmento é o `gl_FragColor`. No fragmento a
+/// precisão é `mediump`: o Mali-400/450 não tem `highp` no fragmento e recusaria o shader.
+fn fonte_es2(tipo: u32, fonte: &str) -> String {
+    let mut saida = String::with_capacity(fonte.len() + 64);
+    for linha in fonte.lines() {
+        let aparada = linha.trim_start();
+        let linha = if tipo == glow::VERTEX_SHADER {
+            if let Some(resto) = aparada.strip_prefix("layout(location = ") {
+                let depois = resto.split_once(") in ").map(|(_, d)| d).unwrap_or(resto);
+                format!("attribute {depois}")
+            } else if let Some(resto) = aparada.strip_prefix("out ") {
+                format!("varying {resto}")
+            } else {
+                linha.to_string()
+            }
+        } else if let Some(resto) = aparada.strip_prefix("in ") {
+            format!("varying {resto}")
+        } else if aparada.starts_with("out vec4 saida;") {
+            String::new()
+        } else {
+            linha.replace("saida = cor;", "gl_FragColor = cor;")
+                .replace("texture(", "texture2D(")
+        };
+        saida.push_str(&linha);
+        saida.push('\n');
+    }
+    saida
+}
+
+/// O ambiente de uma unidade reduzido ao que muda o **código** do shader: o modo e, no
+/// `GL_COMBINE`, função, fontes e operandos. Cores e escalas continuam uniformes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ChaveEnv {
+    modo: i32,
+    cmb: [i32; 2],
+    src: [[i32; 3]; 2],
+    op: [[i32; 3]; 2],
+}
+
+impl ChaveEnv {
+    fn de(env: &TexEnv) -> Self {
+        let modo = codigo_env(env.modo);
+        if modo != 4 {
+            return Self { modo, cmb: [0; 2], src: [[0; 3]; 2], op: [[0; 3]; 2] };
+        }
+        Self {
+            modo,
+            cmb: env.combina.map(codigo_funcao),
+            src: env.fontes.map(|l| l.map(codigo_fonte)),
+            op: env.operandos.map(|l| l.map(codigo_operando)),
+        }
+    }
+}
+
+/// Uma combinação de estado com shader próprio no ES 2.0.
+///
+/// **Por que existe.** O shader geral decide tudo por uniformes inteiros, arrays e laços: é o
+/// pipeline fixo inteiro rodando por pixel. Numa placa de desktop isso sai quase de graça; no
+/// processador de pixels do Mali-400/450 cada ramo custa, e o `discard` desliga o teste de
+/// profundidade antecipado. Medido no RE4 no Mali-450: 270 ms de placa por quadro com 55
+/// desenhos e 328 vértices. Com a combinação fixada no código, o compilador apaga os ramos
+/// mortos e o fragmento vira poucas instruções.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Variante {
+    t0: Option<ChaveEnv>,
+    t1: Option<ChaveEnv>,
+    neblina: bool,
+    /// O código de [`codigo_alfa`]; 7 é teste desligado, e só então não há `discard`.
+    alfa: i32,
+}
+
+/// O fragmento em GLSL ES 1.00 para uma [`Variante`], em linha reta.
+///
+/// Segue caso a caso o shader geral ([`FRAGMENTO`]), que por sua vez segue o `TexEnv` do
+/// rasterizador de software.
+fn fragmento_es2(v: &Variante) -> String {
+    let mut f = String::from(
+        "precision mediump float;\n\
+         varying vec4 vcor;\nvarying vec2 vuv;\nvarying float vfog;\nvarying vec2 vuv1;\n\
+         uniform sampler2D amostra;\nuniform sampler2D amostra1;\n\
+         uniform vec4 cor_env;\nuniform vec4 cor_env1;\n\
+         uniform float escala_rgb;\nuniform float escala_alfa;\n\
+         uniform float escala_rgb1;\nuniform float escala_alfa1;\n\
+         uniform vec3 cor_neblina;\nuniform float ref_alfa;\n\
+         void main() {\n    vec4 primaria = vcor;\n    vec4 cor = primaria;\n",
+    );
+    for (unidade, chave) in [(0, v.t0), (1, v.t1)] {
+        let Some(c) = chave else { continue };
+        let (amostra, uv, suf) = match unidade {
+            0 => ("amostra", "vuv", ""),
+            _ => ("amostra1", "vuv1", "1"),
+        };
+        f.push_str(&format!("    {{\n    vec4 t = texture2D({amostra}, {uv});\n"));
+        match c.modo {
+            0 => f.push_str("    cor = t;\n"),
+            1 => f.push_str("    cor = vec4(cor.rgb * (1.0 - t.a) + t.rgb * t.a, cor.a);\n"),
+            2 => f.push_str("    cor = vec4(min(cor.rgb + t.rgb, vec3(1.0)), cor.a * t.a);\n"),
+            4 => {
+                let fonte = |q: i32| match q {
+                    0 => "t".to_string(),
+                    1 => format!("cor_env{suf}"),
+                    2 => "primaria".to_string(),
+                    _ => "ant".to_string(),
+                };
+                let op_rgb = |op: i32, x: String| match op {
+                    0 => format!("{x}.rgb"),
+                    1 => format!("(vec3(1.0) - {x}.rgb)"),
+                    2 => format!("vec3({x}.a)"),
+                    _ => format!("vec3(1.0 - {x}.a)"),
+                };
+                let op_alfa = |op: i32, x: String| match op {
+                    1 | 3 => format!("(1.0 - {x}.a)"),
+                    _ => format!("{x}.a"),
+                };
+                f.push_str("    vec4 ant = cor;\n");
+                for i in 0..3 {
+                    f.push_str(&format!(
+                        "    vec3 r{i} = {};\n    float a{i} = {};\n",
+                        op_rgb(c.op[0][i], fonte(c.src[0][i])),
+                        op_alfa(c.op[1][i], fonte(c.src[1][i])),
+                    ));
+                }
+                let rgb = match c.cmb[0] {
+                    0 => "r0",
+                    2 => "r0 + r1",
+                    3 => "r0 + r1 - 0.5",
+                    4 => "r0 * r2 + r1 * (1.0 - r2)",
+                    5 => "r0 - r1",
+                    6 | 7 => "vec3(4.0 * dot(r0 - 0.5, r1 - 0.5))",
+                    _ => "r0 * r1",
+                };
+                let alfa = match c.cmb[1] {
+                    0 => "a0",
+                    2 => "a0 + a1",
+                    3 => "a0 + a1 - 0.5",
+                    4 => "a0 * a2 + a1 * (1.0 - a2)",
+                    5 => "a0 - a1",
+                    _ => "a0 * a1",
+                };
+                f.push_str(&format!(
+                    "    vec3 rgb = clamp(({rgb}) * escala_rgb{suf}, 0.0, 1.0);\n    float alfa = clamp(({alfa}) * escala_alfa{suf}, 0.0, 1.0);\n"
+                ));
+                if c.cmb[0] == 7 {
+                    f.push_str("    alfa = rgb.r;\n");
+                }
+                f.push_str("    cor = vec4(rgb, alfa);\n");
+            }
+            _ => f.push_str("    cor = cor * t;\n"),
+        }
+        f.push_str("    }\n");
+    }
+    if v.neblina {
+        f.push_str("    cor = vec4(mix(cor_neblina, cor.rgb, clamp(vfog, 0.0, 1.0)), cor.a);\n");
+    }
+    let falha = match v.alfa {
+        0 => Some("true"),
+        1 => Some("!(cor.a < ref_alfa)"),
+        2 => Some("!(cor.a == ref_alfa)"),
+        3 => Some("!(cor.a <= ref_alfa)"),
+        4 => Some("!(cor.a > ref_alfa)"),
+        5 => Some("!(cor.a != ref_alfa)"),
+        6 => Some("!(cor.a >= ref_alfa)"),
+        _ => None,
+    };
+    if let Some(cond) = falha {
+        f.push_str(&format!("    if ({cond}) {{ discard; }}\n"));
+    }
+    f.push_str("    gl_FragColor = cor;\n}\n");
+    f
+}
+
+/// Liga o vértice traduzido para GLSL ES 1.00 com um fragmento gerado por [`fragmento_es2`].
+unsafe fn liga_es2(gl: &glow::Context, fragmento: &str) -> Result<glow::Program, String> {
+    unsafe {
+        let programa = gl.create_program()?;
+        let mut shaders = Vec::new();
+        let vertice = format!(
+            "#version 100\nprecision highp float;\n{}",
+            fonte_es2(glow::VERTEX_SHADER, VERTICE)
+        );
+        let fragmento = format!("#version 100\n{fragmento}");
+        for (tipo, texto) in [(glow::VERTEX_SHADER, vertice), (glow::FRAGMENT_SHADER, fragmento)] {
+            let shader = gl.create_shader(tipo)?;
+            gl.shader_source(shader, &texto);
+            gl.compile_shader(shader);
+            if !gl.get_shader_compile_status(shader) {
+                let erro = gl.get_shader_info_log(shader);
+                gl.delete_shader(shader);
+                for s in shaders {
+                    gl.delete_shader(s);
+                }
+                gl.delete_program(programa);
+                return Err(erro);
+            }
+            gl.attach_shader(programa, shader);
+            shaders.push(shader);
+        }
+        for (indice, nome) in ATRIBUTOS.iter().enumerate() {
+            gl.bind_attrib_location(programa, indice as u32, nome);
+        }
+        gl.link_program(programa);
+        for s in shaders {
+            gl.detach_shader(programa, s);
+            gl.delete_shader(s);
+        }
+        if !gl.get_program_link_status(programa) {
+            let erro = gl.get_program_info_log(programa);
+            gl.delete_program(programa);
+            return Err(erro);
+        }
+        Ok(programa)
+    }
+}
+
+/// Compila o par de shaders, tentando GLSL 3.30 e caindo para ES 3.00 — ou, numa placa que só
+/// fala ES 2.0, o GLSL ES 1.00 traduzido por [`fonte_es2`].
+unsafe fn compila(gl: &glow::Context, es2: bool) -> Result<glow::Program, String> {
+    if es2 {
+        return unsafe { liga_programa(gl, "#version 100\n", true) };
+    }
     ["#version 330 core\n", "#version 300 es\nprecision highp float;\n"]
         .into_iter()
-        .find_map(|cabecalho| unsafe { liga_programa(gl, cabecalho) }.ok())
+        .find_map(|cabecalho| unsafe { liga_programa(gl, cabecalho, false) }.ok())
         .ok_or_else(|| "nenhuma versão de GLSL aceita".to_string())
 }
 
-unsafe fn liga_programa(gl: &glow::Context, cabecalho: &str) -> Result<glow::Program, String> {
+unsafe fn liga_programa(
+    gl: &glow::Context,
+    cabecalho: &str,
+    es2: bool,
+) -> Result<glow::Program, String> {
     unsafe {
         let programa = gl.create_program()?;
         let mut shaders = Vec::new();
@@ -1505,7 +1922,14 @@ unsafe fn liga_programa(gl: &glow::Context, cabecalho: &str) -> Result<glow::Pro
             (glow::FRAGMENT_SHADER, FRAGMENTO),
         ] {
             let shader = gl.create_shader(tipo)?;
-            gl.shader_source(shader, &format!("{cabecalho}{fonte}"));
+            let texto = match (es2, tipo) {
+                (false, _) => format!("{cabecalho}{fonte}"),
+                (true, glow::FRAGMENT_SHADER) => {
+                    format!("{cabecalho}precision mediump float;\n{}", fonte_es2(tipo, fonte))
+                }
+                (true, _) => format!("{cabecalho}precision highp float;\n{}", fonte_es2(tipo, fonte)),
+            };
+            gl.shader_source(shader, &texto);
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
                 let erro = gl.get_shader_info_log(shader);
@@ -1518,6 +1942,11 @@ unsafe fn liga_programa(gl: &glow::Context, cabecalho: &str) -> Result<glow::Pro
             }
             gl.attach_shader(programa, shader);
             shaders.push(shader);
+        }
+        if es2 {
+            for (indice, nome) in ATRIBUTOS.iter().enumerate() {
+                gl.bind_attrib_location(programa, indice as u32, nome);
+            }
         }
         gl.link_program(programa);
         for shader in shaders {
@@ -1852,6 +2281,8 @@ impl Rasterizador for GpuState {
         height: usize,
         pixels: Vec<[u8; 4]>,
     ) {
+        mede::TEXTURAS.fetch_add(u64::from(mede::ligado()), std::sync::atomic::Ordering::Relaxed);
+        let _cronometro = Cronometro(&mede::NS_TEXTURA, mede::agora());
         self.descarrega();
         let bytes: Vec<u8> = pixels.iter().flatten().copied().collect();
         let gl = &self.gl;
@@ -1884,7 +2315,7 @@ impl Rasterizador for GpuState {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 level as i32,
-                glow::RGBA8 as i32,
+                self.formato_cor(),
                 width as i32,
                 height as i32,
                 0,
@@ -1915,6 +2346,8 @@ impl Rasterizador for GpuState {
         height: u32,
         pixels: &[[u8; 4]],
     ) -> Result<(), Option<(u32, u32)>> {
+        mede::TEXTURAS.fetch_add(u64::from(mede::ligado()), std::sync::atomic::Ordering::Relaxed);
+        let _cronometro = Cronometro(&mede::NS_TEXTURA, mede::agora());
         self.descarrega();
         let resultado = self.estado.sub_image(name, x, y, width, height, pixels);
         if resultado.is_ok() {
@@ -2076,6 +2509,8 @@ impl Rasterizador for GpuState {
     /// Então a faixa pedida é convertida para a linha correspondente do framebuffer e o
     /// resultado sai espelhado de volta.
     fn read_rect(&mut self, x: i32, y: i32, width: usize, height: usize) -> Vec<[u8; 4]> {
+        mede::LEITURAS.fetch_add(u64::from(mede::ligado()), std::sync::atomic::Ordering::Relaxed);
+        let _cronometro = Cronometro(&mede::NS_LEITURA, mede::agora());
         self.descarrega();
         if width == 0 || height == 0 {
             return Vec::new();
@@ -2110,6 +2545,19 @@ impl Rasterizador for GpuState {
         if !self.sujo && out.len() == width * height * 2 {
             return;
         }
+        // **No core Libretro o quadro fica no framebuffer do frontend e é ele que vai para a
+        // tela.** Esta leitura ligava o nosso destino — que ali só é limpo, nunca desenhado — e
+        // esperava a placa terminar: no Mali-450, 41 ms por quadro para trazer um quadro vazio.
+        // Sem ela a cópia da tela do console fica com o último conteúdo, como já ficava para quem
+        // olha: o RetroArch apresenta o framebuffer dele. `ZEEBX_LEITURA=1` devolve a leitura.
+        if self.fbo_externo.is_some() && !leitura_forcada() {
+            if out.len() != width * height * 2 {
+                out.clear();
+                out.resize(width * height * 2, 0);
+            }
+            self.sujo = false;
+            return;
+        }
         let (sw, sh) = self.surface();
         if sw == 0 || sh == 0 {
             return;
@@ -2118,7 +2566,12 @@ impl Rasterizador for GpuState {
         // quadro no Need for Speed — seis vezes a leitura em si —, e a 60 quadros por segundo era
         // a maior fatia do `eglSwapBuffers`. No mesmo tamanho é uma cópia; com reamostragem, o
         // índice de cada coluna sai uma vez por quadro, e não uma vez por pixel.
+        let t_mede = mede::agora();
         let em_565 = self.le_quadro_rgb565(sw, sh);
+        if t_mede.is_some() {
+            mede::LEITURAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        mede::soma(&mede::NS_LEITURA, t_mede);
         out.clear();
         out.resize(width * height * 2, 0);
         if em_565 && sw == width && sh == height {
@@ -2200,7 +2653,7 @@ impl Rasterizador for GpuState {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RGBA8 as i32,
+                self.formato_cor(),
                 colunas as i32,
                 linhas as i32,
                 0,
@@ -2213,9 +2666,11 @@ impl Rasterizador for GpuState {
                 (glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32),
                 (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32),
                 (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32),
-                (glow::TEXTURE_MAX_LEVEL, 0),
             ] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, nome, valor);
+            }
+            if !self.es2 {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, 0);
             }
         }
         // O retângulo cobre a superfície dentro do quadro. As coordenadas já saem prontas, então
@@ -2267,7 +2722,11 @@ impl Rasterizador for GpuState {
         .max(1) as usize;
         let (fw, fh) = self.estado.frame_size();
         let cabe = (maximo / fw.max(fh).max(1)).max(1);
-        let escala = escala.clamp(1, cabe);
+        // Sem `blit_framebuffer` no ES 2.0 o quadro grande não teria como ser reduzido.
+        let escala = match self.es2 {
+            true => 1,
+            false => escala.clamp(1, cabe),
+        };
         if escala != self.escala {
             self.escala = escala;
             self.sujo = true;
@@ -2304,6 +2763,11 @@ impl Rasterizador for GpuState {
         self.descarrega();
         // Mais estreito que o nativo não abre nada; o teto evita um anexo absurdo.
         let aspecto = aspecto.filter(|a| a.is_finite()).map(|a| a.clamp(4.0 / 3.0, 3.6));
+        // A proporção larga lê o centro por blit, que o ES 2.0 não tem.
+        let aspecto = match self.es2 {
+            true => None,
+            false => aspecto,
+        };
         if aspecto != self.proporcao {
             self.proporcao = aspecto;
             self.sujo = true;
@@ -2312,7 +2776,11 @@ impl Rasterizador for GpuState {
 
     fn define_antialias(&mut self, amostras: usize) {
         self.descarrega();
-        let maximo = unsafe { self.gl.get_parameter_i32(glow::MAX_SAMPLES) }.max(1) as usize;
+        // `MAX_SAMPLES` e o renderbuffer com amostras são ES 3.0.
+        let maximo = match self.es2 {
+            true => 1,
+            false => unsafe { self.gl.get_parameter_i32(glow::MAX_SAMPLES) }.max(1) as usize,
+        };
         // Potências de dois são o que as placas oferecem; 1 é desligado.
         let pedido = match amostras {
             0 | 1 => 1,
@@ -3021,3 +3489,80 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod es2 {
+    use super::{fonte_es2, FRAGMENTO, VERTICE};
+
+    #[test]
+    fn vertice_vira_glsl_es_100() {
+        let v = fonte_es2(glow::VERTEX_SHADER, VERTICE);
+        assert!(v.contains("attribute vec4 pos;"), "{v}");
+        assert!(v.contains("attribute vec2 uv1;"), "{v}");
+        assert!(v.contains("varying vec4 vcor;"), "{v}");
+        assert!(!v.contains("layout("), "{v}");
+        assert!(!v.contains("\nout "), "{v}");
+    }
+
+    #[test]
+    fn fragmento_vira_glsl_es_100() {
+        let f = fonte_es2(glow::FRAGMENT_SHADER, FRAGMENTO);
+        assert!(f.contains("varying vec4 vcor;"), "{f}");
+        assert!(f.contains("gl_FragColor = cor;"), "{f}");
+        assert!(f.contains("texture2D(amostra, vuv)"), "{f}");
+        assert!(!f.contains("out vec4 saida"), "{f}");
+        assert!(!f.contains("texture("), "{f}");
+        assert!(!f.contains("\nin "), "{f}");
+    }
+}
+
+#[cfg(test)]
+mod variantes_es2 {
+    use super::{fragmento_es2, ChaveEnv, Variante};
+
+    fn env(modo: i32) -> ChaveEnv {
+        ChaveEnv { modo, cmb: [0; 2], src: [[0; 3]; 2], op: [[0; 3]; 2] }
+    }
+
+    #[test]
+    fn sem_teste_de_alfa_nao_ha_discard() {
+        let f = fragmento_es2(&Variante { t0: Some(env(3)), t1: None, neblina: false, alfa: 7 });
+        assert!(!f.contains("discard"), "{f}");
+        assert!(f.contains("cor = cor * t;"), "{f}");
+        assert!(!f.contains("uniform int"), "{f}");
+    }
+
+    #[test]
+    fn combine_sai_em_linha_reta() {
+        let c = ChaveEnv { modo: 4, cmb: [4, 1], src: [[0, 3, 1], [0, 2, 1]], op: [[0, 1, 2], [2, 3, 2]] };
+        let f = fragmento_es2(&Variante { t0: Some(c), t1: Some(env(0)), neblina: true, alfa: 4 });
+        assert!(f.contains("r0 * r2 + r1 * (1.0 - r2)"), "{f}");
+        assert!(f.contains("vec3 r1 = (vec3(1.0) - ant.rgb);"), "{f}");
+        assert!(f.contains("if (!(cor.a > ref_alfa)) { discard; }"), "{f}");
+        assert!(f.contains("mix(cor_neblina"), "{f}");
+        assert!(!f.contains("for ("), "{f}");
+    }
+
+    /// Escreve as variantes em `target/variantes-es2/` para validação externa (`glslangValidator`).
+    #[test]
+    fn exporta_variantes_para_validar() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/variantes-es2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut n = 0;
+        for modo in [0, 1, 2, 3, 4] {
+            for alfa in [0, 4, 7] {
+                for neblina in [false, true] {
+                    let c = ChaveEnv { modo, cmb: [6, 5], src: [[0, 1, 2], [3, 0, 1]], op: [[3, 2, 1], [1, 0, 3]] };
+                    let v = Variante { t0: Some(c), t1: Some(env(modo)), neblina, alfa };
+                    std::fs::write(dir.join(format!("v{n}.frag")), format!("#version 100\n{}", fragmento_es2(&v))).unwrap();
+                    n += 1;
+                }
+            }
+        }
+        std::fs::write(
+            dir.join("vertice.vert"),
+            format!("#version 100\nprecision highp float;\n{}", super::fonte_es2(glow::VERTEX_SHADER, super::VERTICE)),
+        )
+        .unwrap();
+    }
+}

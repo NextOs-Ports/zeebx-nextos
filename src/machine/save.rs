@@ -2880,7 +2880,7 @@ impl<C: CpuBackend> Machine<C> {
 mod tests {
     use super::*;
     use crate::cpu::BackendPadrao;
-    use crate::loader::self as loader;
+    use crate::loader;
 
     /// O menor módulo que o carregador aceita. Não precisa fazer nada: o alvo aqui é o estado da
     /// máquina em volta dele — memória, registradores e os contadores de alocação.

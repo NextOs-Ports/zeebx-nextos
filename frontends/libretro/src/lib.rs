@@ -134,6 +134,42 @@ const HW_VERSION_MAJOR: u32 = 3;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const HW_VERSION_MINOR: u32 = 2;
 
+/// Os perfis pedidos ao frontend, do mais capaz ao mais modesto, quando o primeiro é recusado.
+///
+/// Os Amlogic com Mali-400/450 (NextOS, CoreELEC) só têm OpenGL ES 2.0, e o driver `gl` do
+/// RetroArch neles responde "unknown context" ao pedido de GLES 3.x. Sem a queda o core ficava
+/// no processador. O `gpu.rs` decide o perfil pela versão real do contexto que veio, não pelo
+/// pedido: com ES 2.0 ele usa GLSL ES 1.00, sem VAO, sem MSAA e com o quadro no tamanho nativo.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const HW_QUEDAS: [(u32, u32, u32); 2] = [
+    (4, 3, 0), // RETRO_HW_CONTEXT_OPENGLES3
+    (2, 2, 0), // RETRO_HW_CONTEXT_OPENGLES2
+];
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+const HW_QUEDAS: [(u32, u32, u32); 0] = [];
+
+/// Se a placa é um Mali Utgard (400/450), que só tem OpenGL ES 2.0.
+///
+/// **Não dá para descobrir pelo pedido.** O RetroArch do NextOS aceita o `SET_HW_RENDER` de GLES3
+/// e só depois, ao criar a superfície, o EGL do Mali responde `EGL_BAD_ATTRIBUTE` e o frontend
+/// fecha com "Cannot open video driver" — o jogo nem abre. Por isso o perfil é escolhido antes:
+/// o driver Utgard proprietário expõe `/dev/mali` (Midgard e Bifrost usam `/dev/mali0`) e o
+/// livre é o `lima`. `ZEEBX_GLES=2` força o ES 2.0 e `ZEEBX_GLES=3` o impede.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn placa_so_gles2() -> bool {
+    match std::env::var("ZEEBX_GLES").ok().as_deref().map(str::trim) {
+        Some("2") => return true,
+        Some("3") => return false,
+        _ => {}
+    }
+    let existe = |p: &str| std::path::Path::new(p).exists();
+    (existe("/dev/mali") && !existe("/dev/mali0")) || existe("/sys/module/lima")
+}
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+fn placa_so_gles2() -> bool {
+    false
+}
+
 #[cfg(not(any(
     target_os = "emscripten",
     all(target_os = "linux", target_arch = "aarch64")
@@ -232,16 +268,27 @@ fn pede_o_contexto_de_placa() {
         context_destroy: Some(contexto_perdido),
         _resto: [0; 4],
     };
-    let alvo = &mut oferta as *mut RetroHwRenderCallback as *mut c_void;
-    if unsafe { environ(ENV_SET_HW_RENDER, alvo) } {
-        log(&format!(
-            "Zeebx: o frontend aceitou render em hardware (OpenGL {}.{}); o desenho passa a ser na placa",
-            oferta.version_major, oferta.version_minor
-        ));
-        if let Ok(mut g) = OFERTA_DE_PLACA.lock() { *g = Some(oferta); }
-    } else {
-        log("Zeebx: o frontend não oferece render em hardware; o desenho fica no processador");
+    let so_gles2 = placa_so_gles2();
+    let pedidos = std::iter::once((HW_CONTEXT, HW_VERSION_MAJOR, HW_VERSION_MINOR))
+        .chain(HW_QUEDAS.iter().copied())
+        // Num Mali Utgard só o pedido de ES 2.0 (tipo 2) é honesto; os outros o frontend aceita
+        // e depois não consegue criar.
+        .filter(|&(tipo, _, _)| !so_gles2 || tipo == 2);
+    for (tipo, maior, menor) in pedidos {
+        oferta.context_type = tipo;
+        oferta.version_major = maior;
+        oferta.version_minor = menor;
+        let alvo = &mut oferta as *mut RetroHwRenderCallback as *mut c_void;
+        if unsafe { environ(ENV_SET_HW_RENDER, alvo) } {
+            log(&format!(
+                "Zeebx: o frontend aceitou render em hardware (contexto {} — OpenGL {}.{}); o desenho passa a ser na placa",
+                tipo, oferta.version_major, oferta.version_minor
+            ));
+            if let Ok(mut g) = OFERTA_DE_PLACA.lock() { *g = Some(oferta); }
+            return;
+        }
     }
+    log("Zeebx: o frontend não oferece render em hardware; o desenho fica no processador");
 }
 
 /// Monta o contexto de GL a partir do resolvedor do frontend e **recria a sessão** na placa.
@@ -1910,6 +1957,7 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut RetroSystemAvInfo) 
 /// `retro_load_game`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn retro_load_game(game: *const RetroGameInfo) -> bool {
+    zeebx::video::gpu::mede::liga();
     if game.is_null() {
         return false;
     }
@@ -2256,6 +2304,57 @@ fn troca_para(estado: &mut Core, caminho: &Path, aberto_pela_z_wheel: bool) -> R
 /// `retro_run`: um quadro virtual, um quadro de vídeo e o áudio correspondente.
 #[unsafe(no_mangle)]
 pub extern "C" fn retro_run() {
+    let inicio = zeebx::video::gpu::mede::agora();
+    retro_run_dentro();
+    if let Some(inicio) = inicio {
+        relata_medicao(inicio.elapsed());
+    }
+}
+
+/// O relatório de `ZEEBX_MEDE=1`: a cada 120 quadros, quanto tempo o `retro_run` levou e quanto
+/// disso foi envio de lotes, leitura do quadro e textura, com os desenhos por quadro.
+fn relata_medicao(duracao: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static QUADROS: AtomicU64 = AtomicU64::new(0);
+    static NS_RUN: AtomicU64 = AtomicU64::new(0);
+    static PAREDE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    NS_RUN.fetch_add(duracao.as_nanos() as u64, Relaxed);
+    let n = QUADROS.fetch_add(1, Relaxed) + 1;
+    if n < 120 {
+        return;
+    }
+    QUADROS.store(0, Relaxed);
+    let run_ms = NS_RUN.swap(0, Relaxed) as f64 / 1e6;
+    let agora = std::time::Instant::now();
+    let parede = PAREDE
+        .lock()
+        .ok()
+        .and_then(|mut g| g.replace(agora))
+        .map(|antes| agora.duration_since(antes).as_secs_f64());
+    let (draws, verts, ms_sub, leituras, ms_ler, texs, ms_tex) = zeebx::video::gpu::mede::colhe();
+    let q = n as f64;
+    let (ms_apl, ms_unif, ms_draw) = zeebx::video::gpu::mede::colhe_partes();
+    log(&format!(
+        "Zeebx MEDE partes: aplica {:.2} ms/q | uniformes {:.2} ms/q | draw {:.2} ms/q",
+        ms_apl / q,
+        ms_unif / q,
+        ms_draw / q
+    ));
+    log(&format!(
+        "Zeebx MEDE: {:.1} fps | run {:.2} ms/q | submete {:.2} ms/q ({:.0} draws, {:.0} vert) | leitura {:.2} ms/q ({:.1}/q) | textura {:.2} ms/q ({:.1}/q)",
+        parede.map_or(0.0, |p| q / p),
+        run_ms / q,
+        ms_sub / q,
+        draws as f64 / q,
+        verts as f64 / q,
+        ms_ler / q,
+        leituras as f64 / q,
+        ms_tex / q,
+        texs as f64 / q,
+    ));
+}
+
+fn retro_run_dentro() {
     // Os buffers saem do estado antes das chamadas ao frontend: nenhum cadeado do core fica preso
     // enquanto o frontend executa, e é isso que impede um aviso dele — "disco cheio, quer salvar?"
     // — de travar o emulador.

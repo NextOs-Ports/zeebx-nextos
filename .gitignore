@@ -45,3 +45,9 @@ ref z-wheel2.png
 frontends/android/apk/.gradle/
 frontends/android/apk/local.properties
 frontends/android/apk/app/src/main/jniLibs/
+
+# NextOS: artefatos locais do build cruzado e medições
+/.local/
+/nextos/out/
+/nextos/build-*.log
+/nextos/toolchain.cmake
