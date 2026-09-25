@@ -20,7 +20,10 @@ export AR_$TU="$TC/bin/$TRIPLO-ar"
 export CFLAGS_$TU="--sysroot=$SR"
 export CXXFLAGS_$TU="--sysroot=$SR"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$TC/bin/$TRIPLO-gcc"
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--sysroot=$SR -C target-cpu=cortex-a53"
+EXTRA_RUSTFLAGS=""
+# ZEEBX_PERFIL=1: build de medição com ponteiros de quadro, para o amostrador subir a pilha.
+[ -n "${ZEEBX_PERFIL:-}" ] && EXTRA_RUSTFLAGS="-C force-frame-pointers=yes"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--sysroot=$SR -C target-cpu=cortex-a53 $EXTRA_RUSTFLAGS"
 export CMAKE_GENERATOR=Ninja
 export CARGO_PROFILE_RELEASE_DEBUG=0
 TCFILE=$PWD/nextos/toolchain.cmake
@@ -42,5 +45,7 @@ SO=target/$T/release/libzeebx_libretro.so
 file "$SO" | cut -d, -f1-3
 "$TC/bin/$TRIPLO-readelf" -d "$SO" | grep -E "NEEDED|RPATH|RUNPATH" || true
 "$TC/bin/$TRIPLO-readelf" -V "$SO" | grep -oE 'GLIBC_[0-9.]+|GLIBCXX_[0-9.]+' | sort -Vu | tail -2
-mkdir -p nextos/out && cp "$SO" nextos/out/zeebx_libretro.so && cp frontends/libretro/zeebx_libretro.info nextos/out/
-sha256sum nextos/out/zeebx_libretro.so
+SAIDA=nextos/out/zeebx_libretro.so
+[ -n "${ZEEBX_PERFIL:-}" ] && SAIDA=nextos/out/zeebx_libretro-perfil.so
+mkdir -p nextos/out && cp "$SO" "$SAIDA" && cp frontends/libretro/zeebx_libretro.info nextos/out/
+sha256sum "$SAIDA"

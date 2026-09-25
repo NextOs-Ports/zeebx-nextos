@@ -15,8 +15,10 @@
 #include <sys/time.h>
 #include <ucontext.h>
 
-#define ZEEBX_PROF_MAX (1u << 20)
-static unsigned long zeebx_prof_pcs[ZEEBX_PROF_MAX];
+#define ZEEBX_PROF_MAX (1u << 18)
+#define ZEEBX_PROF_PROF 12
+/* Cada amostra: o PC e até ZEEBX_PROF_PROF-1 endereços de retorno, subindo pelos x29. */
+static unsigned long zeebx_prof_pcs[ZEEBX_PROF_MAX][ZEEBX_PROF_PROF];
 static volatile unsigned zeebx_prof_n;
 static int zeebx_prof_on;
 
@@ -24,8 +26,29 @@ static void zeebx_prof_handler(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)si;
     ucontext_t *uc = (ucontext_t *)ctx;
     unsigned i = __atomic_fetch_add(&zeebx_prof_n, 1, __ATOMIC_RELAXED);
-    if (i < ZEEBX_PROF_MAX)
-        zeebx_prof_pcs[i] = (unsigned long)uc->uc_mcontext.pc;
+    if (i >= ZEEBX_PROF_MAX)
+        return;
+    unsigned long *s = zeebx_prof_pcs[i];
+    s[0] = (unsigned long)uc->uc_mcontext.pc;
+    /* O x30 (lr) cobre a função folha que ainda não empilhou o quadro. */
+    s[1] = (unsigned long)uc->uc_mcontext.regs[30];
+    unsigned long fp = (unsigned long)uc->uc_mcontext.regs[29];
+    unsigned long sp = (unsigned long)uc->uc_mcontext.sp;
+    for (int k = 2; k < ZEEBX_PROF_PROF; k++) {
+        /* Só segue quadros na pilha desta thread, crescendo para cima, alinhados. */
+        if (fp < sp || fp - sp > (8u << 20) || (fp & 7)) {
+            s[k] = 0;
+            continue;
+        }
+        unsigned long *quadro = (unsigned long *)fp;
+        s[k] = quadro[1];
+        unsigned long proximo = quadro[0];
+        if (proximo <= fp) {
+            for (int r = k + 1; r < ZEEBX_PROF_PROF; r++) s[r] = 0;
+            break;
+        }
+        fp = proximo;
+    }
 }
 
 __attribute__((constructor)) static void zeebx_prof_init(void) {
@@ -52,12 +75,19 @@ void zeebx_prof_dump(void) {
     if (!f)
         return;
     for (unsigned i = 0; i < n; i++) {
-        Dl_info d;
-        unsigned long pc = zeebx_prof_pcs[i];
-        if (dladdr((void *)pc, &d) && d.dli_fname)
-            fprintf(f, "%s %lx\n", d.dli_fname, pc - (unsigned long)d.dli_fbase);
-        else
-            fprintf(f, "JIT %lx\n", pc);
+        for (int k = 0; k < ZEEBX_PROF_PROF; k++) {
+            Dl_info d;
+            unsigned long pc = zeebx_prof_pcs[i][k];
+            if (k > 0 && pc == 0)
+                break;
+            if (k > 0)
+                fputc(';', f);
+            if (dladdr((void *)pc, &d) && d.dli_fname)
+                fprintf(f, "%s %lx", d.dli_fname, pc - (unsigned long)d.dli_fbase);
+            else
+                fprintf(f, "JIT %lx", pc);
+        }
+        fputc('\n', f);
     }
     fclose(f);
     rename("/tmp/zeebx-prof.txt.tmp", "/tmp/zeebx-prof.txt");

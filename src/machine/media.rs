@@ -916,6 +916,16 @@ impl<C: CpuBackend> Machine<C> {
             return Ok(());
         }
         let now = self.now_us();
+        // No máximo uma varredura por milissegundo do relógio virtual: o aviso de fim atrasa
+        // menos de 1 ms, e o Pac-Mania deixava de gastar 6,7% do processador aqui.
+        // Relógio que voltou (save state) não fica preso: só pula se a próxima varredura está a
+        // no máximo 1 ms à frente.
+        if now < self.proxima_varredura_de_midia
+            && self.proxima_varredura_de_midia - now <= 1000
+        {
+            return Ok(());
+        }
+        self.proxima_varredura_de_midia = now.saturating_add(1000);
         if !self
             .media
             .values()

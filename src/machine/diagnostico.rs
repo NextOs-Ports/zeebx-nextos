@@ -212,9 +212,12 @@ impl<C: CpuBackend> Machine<C> {
 
     /// Quantas vezes cada método foi chamado, em ordem — o backlog de APIs, medido.
     pub fn call_log(&self) -> Vec<(String, u64)> {
-        self.calls
-            .iter()
-            .map(|(&(iface, slot), &count)| (aee::describe(aee::encode_raw(iface, slot)), count))
+        // O mapa é por hash (é tocado em toda chamada de API); a ordem sai daqui.
+        let mut chaves: Vec<_> = self.calls.iter().map(|(&k, &v)| (k, v)).collect();
+        chaves.sort_unstable();
+        chaves
+            .into_iter()
+            .map(|((iface, slot), count)| (aee::describe(aee::encode_raw(iface, slot)), count))
             .collect()
     }
 

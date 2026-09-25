@@ -2523,6 +2523,8 @@ pub struct Machine<C: CpuBackend> {
     egl_context: u32,
     /// Estado de reprodução de cada `IMedia` vivo.
     media: HashMap<u32, MediaState>,
+    /// Ver `poll_media`: antes deste instante do relógio virtual não vale varrer as mídias.
+    proxima_varredura_de_midia: u64,
     /// Os sons entregues aos `IMedia`, já lidos, pela chave do conteúdo. Ver
     /// [`CargaDeMidia`].
     cargas_de_midia: HashMap<u64, CargaDeMidia>,
@@ -2654,7 +2656,7 @@ pub struct Machine<C: CpuBackend> {
     #[cfg(feature = "soundfont")]
     banco_de_som: Option<std::sync::Arc<crate::audio::soundfont::Banco>>,
     /// Quantas vezes cada método foi chamado — o retrato do que o jogo usa.
-    calls: BTreeMap<(u32, u32), u64>,
+    calls: rustc_hash::FxHashMap<(u32, u32), u64>,
     /// Total de chamadas atendidas, para aplicar o teto.
     calls_total: u64,
     /// Se o quadro **de agora** deve pular o desenho — 3D e a limpeza de tela, não a lógica.
@@ -3058,6 +3060,7 @@ impl<C: CpuBackend> Machine<C> {
             egl_surface: 0,
             egl_context: 0,
             media: HashMap::new(),
+            proxima_varredura_de_midia: 0,
             cargas_de_midia: HashMap::new(),
             audio: None,
             gl_last_frame: Vec::new(),
@@ -3105,7 +3108,7 @@ impl<C: CpuBackend> Machine<C> {
             // banco não vem embutido, e sem ele a música volta para a tabela de timbres.
             #[cfg(feature = "soundfont")]
             banco_de_som: banco_do_aparelho(&aparelho, midi_policy),
-            calls: BTreeMap::new(),
+            calls: Default::default(),
             calls_total: 0,
             pula_desenho: false,
             gl_leitura_de_pixels: false,

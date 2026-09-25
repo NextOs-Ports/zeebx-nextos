@@ -308,7 +308,9 @@ impl Callbacks for Estado {
             return false;
         }
         *cb.constantes.borrow_mut().entry(pagina).or_insert(0) |= mascara;
-        conta::DOBRAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::video::gpu::mede::ligado() {
+            conta::DOBRAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         true
     }
 
@@ -331,7 +333,9 @@ impl Callbacks for Estado {
     }
 
     extern "C" fn memory_read<T: GuestInt>(cb: &CallbackImpl<Self>, addr: VAddr) -> T {
-        conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::video::gpu::mede::ligado() {
+            conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut bytes = [0u8; 8];
         let len = size_of::<T>();
         if !cb.le(addr, &mut bytes[..len]) {
@@ -343,7 +347,9 @@ impl Callbacks for Estado {
     }
 
     extern "C" fn memory_write<T: GuestInt>(cb: &mut CallbackImpl<Self>, addr: VAddr, value: T) {
-        conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::video::gpu::mede::ligado() {
+            conta::LENTAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let len = size_of::<T>();
         let bytes = unsafe { std::slice::from_raw_parts((&value as *const T).cast::<u8>(), len) };
         if !cb.escreve(addr, bytes) {
@@ -509,13 +515,17 @@ impl DynarmicCpu {
         };
         jit.marca_codigo_sujo(addr, len);
         if jit.limpa_tudo.replace(false) {
-            conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::video::gpu::mede::ligado() {
+                conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             jit.codigo_sujo.borrow_mut().clear();
             jit.clear_cache();
         }
         let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
         for linha in linhas {
-            conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::video::gpu::mede::ligado() {
+                conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             jit.invalidate_cache_range(linha, LINHA as usize);
         }
     }
@@ -733,13 +743,17 @@ impl CpuBackend for DynarmicCpu {
         // Não há invalidação para páginas de dados: só código previamente executado chega aqui.
         // É seguro mexer no cache depois de o JIT devolver o controle, nunca da callback.
         if jit.limpa_tudo.replace(false) {
-            conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::video::gpu::mede::ligado() {
+                conta::LIMPEZAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             jit.codigo_sujo.borrow_mut().clear();
             jit.clear_cache();
         }
         let linhas = std::mem::take(&mut *jit.codigo_sujo.borrow_mut());
         for linha in linhas {
-            conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::video::gpu::mede::ligado() {
+                conta::INVALIDACOES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             jit.invalidate_cache_range(linha, LINHA as usize);
         }
         match jit.parada.get() {

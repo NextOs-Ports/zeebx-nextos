@@ -1008,8 +1008,12 @@ impl<C: CpuBackend> Machine<C> {
                 let inicio = y0 as usize * largura + x0 as usize;
                 let fim = (y1 as usize - 1) * largura + x1 as usize;
                 let bytes = fb.rgb565_fatia(inicio, fim);
-                conta::PARCIAIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                if crate::video::gpu::mede::ligado() {
+                    conta::PARCIAIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if crate::video::gpu::mede::ligado() {
+                    conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.cpu.write_mem(buffer + inicio as u32 * 2, &bytes)?;
             } else {
                 // Linha a linha: caixa estreita, ou enchimento no fim da linha, que faz a faixa
@@ -1017,16 +1021,24 @@ impl<C: CpuBackend> Machine<C> {
                 for linha in y0 as usize..y1 as usize {
                     let inicio = linha * largura + x0 as usize;
                     let bytes = fb.rgb565_fatia(inicio, linha * largura + x1 as usize);
-                    conta::PARCIAIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if crate::video::gpu::mede::ligado() {
+                        conta::PARCIAIS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if crate::video::gpu::mede::ligado() {
+                        conta::BYTES_PARCIAIS.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let destino = linha * passo + x0 as usize * 2;
                     self.cpu.write_mem(buffer + destino as u32, &bytes)?;
                 }
             }
         } else {
             let bytes = fb.to_dib_bytes();
-            conta::ESCRITAS_INTEIRAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            conta::BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if crate::video::gpu::mede::ligado() {
+                conta::ESCRITAS_INTEIRAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if crate::video::gpu::mede::ligado() {
+                conta::BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             self.cpu.write_mem(buffer, &bytes)?;
         }
         self.dib_herdados.remove(&bitmap);
@@ -1071,8 +1083,12 @@ impl<C: CpuBackend> Machine<C> {
         if !self.cpu.take_dirty(bitmap) {
             return Ok(());
         }
-        conta::LEITURAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        conta::BYTES.fetch_add(tamanho as u64, std::sync::atomic::Ordering::Relaxed);
+        if crate::video::gpu::mede::ligado() {
+            conta::LEITURAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if crate::video::gpu::mede::ligado() {
+            conta::BYTES.fetch_add(tamanho as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut bytes = vec![0u8; tamanho];
         self.cpu.read_mem(buffer, &mut bytes)?;
         if let Some(fb) = self.bitmaps.get_mut(&bitmap) {
@@ -1090,8 +1106,12 @@ impl<C: CpuBackend> Machine<C> {
     /// Chamado só nas interfaces que mexem em pixels: um jogo faz dezenas de milhares de
     /// chamadas de outras APIs, e copiar 600 KB em cada uma seria inviável.
     pub(super) fn sync_surfaces_in(&mut self) -> Result<(), CpuError> {
-        conta::SYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        conta::DIBS.store(self.dib_buffers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if crate::video::gpu::mede::ligado() {
+            conta::SYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if crate::video::gpu::mede::ligado() {
+            conta::DIBS.store(self.dib_buffers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         // **Nada mudou, nada a fazer.** O Pac-Mania chama isto 2.800 vezes por quadro, e cada
         // passada percorria as 49 superfícies dele sem copiar nada. Pular exige as três coisas:
         // a última passada acabou com toda vigia limpa, nenhuma ficou suja desde então (geração
