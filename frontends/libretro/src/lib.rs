@@ -627,8 +627,10 @@ struct Core {
     bitmasks: bool,
     /// Se o frontend aceita quadro nulo quando a tela não mudou.
     aceita_dupe: bool,
-    /// Assinatura do último quadro entregue.
-    ultima_assinatura: Option<u64>,
+    /// (série, escritas) da tela no último quadro copiado para `frame`: igual de novo, nada mudou.
+    chave_do_quadro: Option<(u64, u64)>,
+    /// As linhas `[y0, y1)` em que o último quadro copiado diferia do anterior.
+    faixa_do_quadro: Option<(usize, usize)>,
     /// As trocas de buffer do GL vistas no quadro anterior. Com placa, um quadro sem troca é
     /// quadro 2D (IDisplay): vai por software, porque o framebuffer do frontend não tem nada dele.
     swaps_vistos: u32,
@@ -2188,7 +2190,8 @@ unsafe fn carrega(
         aberto_pela_z_wheel: false,
         bitmasks: false,
         aceita_dupe: false,
-        ultima_assinatura: None,
+        chave_do_quadro: None,
+        faixa_do_quadro: None,
         swaps_vistos: 0,
         ultimo_relogio_ms: 0,
         audio_pendente: Vec::new(),
@@ -2299,10 +2302,31 @@ fn troca_para(estado: &mut Core, caminho: &Path, aberto_pela_z_wheel: bool) -> R
     estado.aberto_pela_z_wheel = aberto_pela_z_wheel;
     estado.parou = false;
     estado.quadros_apos_parar = 0;
-    estado.ultima_assinatura = None;
+    estado.chave_do_quadro = None;
+    estado.frame.clear();
     estado.select_antes = false;
     estado.ultimo_relogio_ms = estado.session.clock_ms();
     Ok(())
+}
+
+/// Copia para `quadro` (RGB565 little-endian, linha a linha) só as linhas da tela que diferem
+/// dele e devolve a faixa `[y0, y1)` que mudou, ou `None` quando nada mudou.
+///
+/// `quadro` de outro tamanho é refeito inteiro, e aí a faixa é a tela toda.
+fn faixa_que_mudou(tela: &zeebx::video::display::Framebuffer, quadro: &mut Vec<u8>) -> Option<(usize, usize)> {
+    let (largura, altura) = (tela.width() as usize, tela.height() as usize);
+    let bytes = tela.rgb565_fatia(0, largura * altura);
+    if quadro.len() != bytes.len() {
+        quadro.clear();
+        quadro.extend_from_slice(&bytes);
+        return (altura > 0).then_some((0, altura));
+    }
+    let passo = largura * 2;
+    let linha = |y: usize| y * passo..(y + 1) * passo;
+    let y0 = (0..altura).find(|&y| bytes[linha(y)] != quadro[linha(y)])?;
+    let y1 = (y0..altura).rev().find(|&y| bytes[linha(y)] != quadro[linha(y)]).unwrap_or(y0) + 1;
+    quadro[y0 * passo..y1 * passo].copy_from_slice(&bytes[y0 * passo..y1 * passo]);
+    Some((y0, y1))
 }
 
 /// `retro_run`: um quadro virtual, um quadro de vídeo e o áudio correspondente.
@@ -2664,18 +2688,30 @@ fn retro_run_dentro() {
         } else if estado.limite_fps_duplica {
             estado.aceita_dupe
         } else {
-            tela.write_rgb565_into(&mut quadro);
-            let assinatura = tela.signature();
-            let igual = estado.aceita_dupe && estado.ultima_assinatura == Some(assinatura);
-            estado.ultima_assinatura = Some(assinatura);
-            igual
+            // **Só as linhas que mudaram.** O quadro guardado é o último entregue, e a textura da
+            // tela na placa é cópia dele; comparar linha a linha acha a faixa que mudou, e só ela
+            // é copiada e subida. Antes eram três passadas de 600 KB por quadro — cópia,
+            // assinatura FNV (serial: uma multiplicação por pixel) e o `glTexImage2D` inteiro,
+            // que o Mali ainda converte para blocos. Com a mesma superfície e as mesmas escritas
+            // de antes, nem a comparação: nada foi escrito.
+            let chave = (tela.serie(), tela.escritas());
+            let faixa = if estado.chave_do_quadro == Some(chave) && quadro.len() == tela.pixels().len() * 2 {
+                None
+            } else {
+                faixa_que_mudou(tela, &mut quadro)
+            };
+            estado.chave_do_quadro = Some(chave);
+            estado.faixa_do_quadro = faixa;
+            estado.aceita_dupe && faixa.is_none()
         };
         // O quadro 2D vai para o framebuffer do frontend como textura: com contexto de placa o
-        // RetroArch apresenta o framebuffer e ignora quadro por software.
+        // RetroArch apresenta o framebuffer e ignora quadro por software. Sem faixa (quadro igual
+        // ao anterior, num frontend que não aceita repetir) sobe a tela toda: é o que se fazia.
         if quadro_2d && !duplicado {
+            let faixa = estado.faixa_do_quadro.unwrap_or((0, altura as usize));
             estado
                 .session
-                .pinta_tela_na_placa(largura as usize, altura as usize, &quadro);
+                .pinta_tela_na_placa(largura as usize, altura as usize, &quadro, faixa);
         }
         // Áudio: **o tempo vem do relógio virtual**, não de um número fixo. Um jogo que passa dois
         // quadros virtuais entre duas chamadas precisa entregar o dobro de amostras, senão o som

@@ -891,6 +891,66 @@ mod tests {
     }
 
     #[test]
+    fn blit_recortado_copia_o_mesmo_que_pixel_a_pixel() {
+        // Origem 5×4 com um padrão e a cor-chave espalhada; destino 6×5. O blit com borda
+        // negativa dos dois lados tem de dar o mesmo que o laço de referência, pixel a pixel.
+        let mut src = Framebuffer::new(5, 4);
+        for y in 0..4 {
+            for x in 0..5 {
+                let v = if (x + y) % 3 == 0 { 0xf81f } else { (y * 5 + x + 1) as u16 };
+                src.set_pixel_native(x, y, v);
+            }
+        }
+        for &(dx, dy, w, h, sx, sy, chave) in &[
+            (-2, 1, 6, 6, 0, -1, Some(0xf81f)),
+            (3, -1, 4, 3, 2, 1, None),
+            (0, 0, 5, 4, 0, 0, Some(0xf81f)),
+        ] {
+            let mut rapido = Framebuffer::new(6, 5);
+            rapido.blit(dx, dy, w, h, &src, sx, sy, chave);
+            let mut referencia = Framebuffer::new(6, 5);
+            let mut escritas = 0;
+            for row in 0..h {
+                for col in 0..w {
+                    let v = src.get_pixel(sx + col, sy + row);
+                    let dentro = sx + col >= 0 && sy + row >= 0 && sx + col < 5 && sy + row < 4;
+                    let (x, y) = (dx + col, dy + row);
+                    if dentro && Some(v) != chave && x >= 0 && y >= 0 && x < 6 && y < 5 {
+                        referencia.set_pixel_native(x, y, v);
+                        escritas += 1;
+                    }
+                }
+            }
+            assert_eq!(rapido.pixels(), referencia.pixels());
+            assert_eq!(rapido.escritas(), escritas);
+        }
+    }
+
+    #[test]
+    fn so_a_transicao_para_suja_entra_no_anel() {
+        let mut fb = Framebuffer::new(4, 4);
+        fb.toma_sujeira();
+        let cursor = cursor_das_sujas();
+        fb.set_pixel_native(0, 0, 1);
+        fb.set_pixel_native(1, 1, 2);
+        fb.fill_rect_native(Rect { x: 0, y: 0, width: 2, height: 2 }, 3);
+        let mut vistas = Vec::new();
+        // Outros testes rodam em paralelo e escrevem no mesmo anel: só a nossa série conta.
+        let novo = sujas_desde(cursor, |s| vistas.push(s));
+        if novo.is_some() {
+            assert_eq!(vistas.iter().filter(|&&s| s == fb.serie()).count(), 1);
+        }
+        assert_eq!(fb.sujeira(), Some([0, 0, 2, 2]));
+        fb.toma_sujeira();
+        let cursor = cursor_das_sujas();
+        fb.set_pixel_native(3, 3, 1);
+        let mut vistas = Vec::new();
+        if sujas_desde(cursor, |s| vistas.push(s)).is_some() {
+            assert!(vistas.contains(&fb.serie()));
+        }
+    }
+
+    #[test]
     fn bmp_tem_cabecalho_e_tamanho_certos() {
         let mut fb = Framebuffer::new(2, 2);
         fb.set_pixel(0, 0, Rgb::WHITE);

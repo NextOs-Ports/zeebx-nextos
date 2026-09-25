@@ -274,6 +274,8 @@ pub struct GpuState {
     ponte: glow::Texture,
     /// A textura da tela 2D, para [`Rasterizador::pinta_tela_rgb565`]. Criada no primeiro uso.
     tela_2d: Option<glow::Texture>,
+    /// O tamanho com que a [`GpuState::tela_2d`] foi alocada: diferente, ela é refeita inteira.
+    tamanho_da_tela_2d: Option<(usize, usize)>,
     texturas: HashMap<u32, Textura>,
     /// Buffers reaproveitados entre chamadas, para não pedir memória por quadro.
     vertices: Vec<f32>,
@@ -401,6 +403,7 @@ impl GpuState {
             soltos: Vec::new(),
             ponte,
             tela_2d: None,
+            tamanho_da_tela_2d: None,
             texturas: HashMap::new(),
             vertices: Vec::new(),
             pixels: Vec::new(),
@@ -2011,7 +2014,13 @@ impl Rasterizador for GpuState {
         self.fbo_externo.is_some() && !leitura_forcada()
     }
 
-    fn pinta_tela_rgb565(&mut self, largura: usize, altura: usize, rgb565: &[u8]) {
+    fn pinta_tela_rgb565(
+        &mut self,
+        largura: usize,
+        altura: usize,
+        rgb565: &[u8],
+        faixa: (usize, usize),
+    ) {
         if largura == 0 || altura == 0 || rgb565.len() < largura * altura * 2 {
             return;
         }
@@ -2022,26 +2031,48 @@ impl Rasterizador for GpuState {
             None => match unsafe { gl.create_texture() } {
                 Ok(t) => {
                     self.tela_2d = Some(t);
+                    self.tamanho_da_tela_2d = None;
                     t
                 }
                 Err(_) => return,
             },
         };
         self.destino();
+        // **Só a faixa que mudou**, quando a textura já tem o resto: mesmo tamanho de antes. O
+        // `glTexImage2D` da tela inteira realocava a textura e o Mali convertia os 600 KB para
+        // blocos a cada quadro; o `glTexSubImage2D` de linhas inteiras é contíguo no quadro, e
+        // um menu com um cursor piscando sobe umas poucas linhas.
+        let (y0, y1) = (faixa.0.min(altura), faixa.1.min(altura));
+        let inteira = self.tamanho_da_tela_2d != Some((largura, altura));
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(textura));
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 2);
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGB as i32,
-                largura as i32,
-                altura as i32,
-                0,
-                glow::RGB,
-                glow::UNSIGNED_SHORT_5_6_5,
-                glow::PixelUnpackData::Slice(Some(&rgb565[..largura * altura * 2])),
-            );
+            if inteira {
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGB as i32,
+                    largura as i32,
+                    altura as i32,
+                    0,
+                    glow::RGB,
+                    glow::UNSIGNED_SHORT_5_6_5,
+                    glow::PixelUnpackData::Slice(Some(&rgb565[..largura * altura * 2])),
+                );
+                self.tamanho_da_tela_2d = Some((largura, altura));
+            } else if y0 < y1 {
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    y0 as i32,
+                    largura as i32,
+                    (y1 - y0) as i32,
+                    glow::RGB,
+                    glow::UNSIGNED_SHORT_5_6_5,
+                    glow::PixelUnpackData::Slice(Some(&rgb565[y0 * largura * 2..y1 * largura * 2])),
+                );
+            }
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
             for (nome, valor) in [
                 (glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32),
